@@ -43,14 +43,15 @@ export MILVUS_URI="http://localhost:19530"
 - `data/test_multi_vector`
 - `data/query_samples`
 
-默认每个目录生成 4 个 `.h5` 分片，每个分片 25 万条，总计 100 万条。脚本重跑时会按分片数量、行数和关键维度参数判断是否跳过生成。
+默认每个目录生成 4 个 `.h5` 分片，每个分片 25 万条，总计 100 万条。脚本重跑时会按分片数量、行数、关键维度参数和公共标量数据版本判断是否跳过生成。
 
-默认数据量很大：单向量 HDF5 原始向量 payload 约 1.91 GiB；多向量按 `1000000 x 300 x 128 x fp16` 计算，仅向量 payload 约 71.53 GiB，实际文件还包含标量字段和 HDF5 元数据。
+默认数据量很大：单向量 HDF5 原始向量 payload 约 1.91 GiB；多向量按 `1000000 x 300 x 128 x fp16` 计算，仅向量 payload 约 71.53 GiB，实际文件还包含标量字段和 HDF5 元数据。标量字段中 `uuid1` / `uuid2` 使用标准 UUID 字符串，`platform` / `text` 使用 UTF-8 中文内容，`text` 为随机中文字符串。
 
 ## 执行前注意事项
 
 - 写入脚本默认会 drop 已存在的目标 collection 后重建；如果只是检查现有 collection，不要直接运行写入命令，或加 `--no-drop` 让脚本在 collection 已存在时报错退出。
 - 写入脚本支持 `--num-shards` 和 `--replica-number`：前者传给 Milvus `create_collection(num_shards=...)`，只在新建 collection 时生效；后者传给 `load_collection(replica_number=...)`，需要集群有足够 QueryNode 或 resource group 容量。
+- 写入脚本支持 `--delete-ratio` 模拟 update 压力：默认 `0`，不执行额外操作；取值 `1-100` 时，每 100 条插入数据中选最后 N 条执行 `query -> delete -> insert`，其中 query/delete 使用 `uuid1` 和 `text` 等值 filter，最后再把同一条记录原样插回去。
 - 参数必须保持一致：单向量写入的 `--vector-dim` 要等于查询脚本的 `--vector-dim`；多向量写入的 `--vector-dim` 要等于查询脚本的 `--multi-vector-dim`。
 - 多向量写入的 `--token-count` 是 collection 每条样本最大 token vector 数量，查询脚本的 `--query-token-count` 是每条查询使用的 token vector 数量；当前默认写入 300、查询 30。
 - 修改维度、token 数、`data_id_max` 或数据规模后，旧 HDF5 分片可能不再匹配；建议加 `--force-regenerate` 重新生成。查询脚本会在读取分片前校验 attrs 和 dataset shape。
@@ -100,6 +101,7 @@ export MILVUS_URI="http://localhost:19530"
 - `stored_dtype`：HDF5 分片中的向量存储精度；多向量脚本当前为 `float16`。
 - `milvus_mode` / `multi_vector_mode`：多向量在 Milvus 里的写入/查询模式；当前默认 `struct-float32`。
 - `insert_batch_size`：每次 `client.insert()` 提交的样本数。
+- `delete_ratio`：写入脚本的 update 模拟比例，默认 `0` 表示关闭；例如 `1` 表示每 100 条插入后对最后 1 条执行 `query -> delete -> insert`。
 - `query_read_batch_size`：查询脚本每次从 HDF5 分片读入内存的样本数。
 - `concurrency`：线程池并发数。
 - `index_type`：向量索引类型，默认 `HNSW`。
@@ -123,6 +125,7 @@ export MILVUS_URI="http://localhost:19530"
 - `--skip-generate`：跳过数据生成，直接读取现有 HDF5 分片执行建表、写入或查询。
 - `--generate-only`：只生成 HDF5 分片，生成完成后退出。
 - `--seed`：随机数据生成种子，默认 `20260610`。
+- `--delete-ratio`：仅写入脚本支持，范围 `0-100`，默认 `0`。为 `0` 时只执行原始插入；大于 0 时每 100 条中选最后 N 条模拟 update，流程为先按 `uuid1` 和 `text` 等值查询，再删除旧记录，最后将同一条记录插回去。
 - `--no-drop`：仅写入脚本支持；collection 已存在时不删除重建，而是报错退出。
 - `--no-load`：仅查询脚本支持；查询前不调用 `load_collection`，适合 collection 已经由外部加载的场景。
 - `--hnsw-m` / `--hnsw-ef-construction`：建 HNSW 索引时的 `M` 和 `efConstruction` 参数。
@@ -218,7 +221,8 @@ uv run python scripts/insert_single_vector.py \
   --index-type HNSW \
   --hnsw-m 16 \
   --hnsw-ef-construction 200 \
-  --seed 20260610
+  --seed 20260610 \
+  --delete-ratio 0
 ```
 
 ### 2. 多向量写入
@@ -250,7 +254,8 @@ uv run python scripts/insert_multi_vector.py \
   --hnsw-m 16 \
   --hnsw-ef-construction 200 \
   --vector-chunk-rows 4 \
-  --seed 20260610
+  --seed 20260610 \
+  --delete-ratio 0
 ```
 
 ### 3. 查询压测

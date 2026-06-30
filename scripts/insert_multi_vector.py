@@ -14,7 +14,9 @@ import numpy as np
 from pymilvus import DataType
 
 from milvus_bench_common import (
+    COMMON_DATA_VERSION,
     OperationResult,
+    delete_ratio_candidates,
     add_connection_args,
     add_data_args,
     config_from_args,
@@ -32,6 +34,7 @@ from milvus_bench_common import (
     shard_row_count,
     shards_are_complete,
     print_result_table,
+    query_delete_then_insert_records,
 )
 
 DEFAULT_COLLECTION = "test_multi_vector"
@@ -63,12 +66,13 @@ def parse_args() -> argparse.Namespace:
         help="HDF5 chunk row count for the multi-vector dataset; affects local shard IO only",
     )
     parser.add_argument("--seed", type=int, default=20260610)
+    parser.add_argument("--delete-ratio", type=int, default=0, help="Delete the last N rows in each 100 inserted rows; 0 disables delete simulation")
     parser.add_argument("--no-drop", action="store_true", help="Do not drop an existing collection")
     return parser.parse_args()
 
 
 def generate_shards(args: argparse.Namespace) -> None:
-    attrs = {"kind": "multi_vector", "vector_dim": args.vector_dim, "token_count": args.token_count}
+    attrs = {"kind": "multi_vector", "vector_dim": args.vector_dim, "token_count": args.token_count, "common_data_version": COMMON_DATA_VERSION}
     if not args.force_regenerate and shards_are_complete(
         args.data_dir, args.total_rows, args.shard_rows, required_attrs=attrs
     ):
@@ -93,6 +97,7 @@ def generate_shards(args: argparse.Namespace) -> None:
             h5.attrs["shard_rows"] = args.shard_rows
             h5.attrs["total_rows"] = args.total_rows
             h5.attrs["vector_dim"] = args.vector_dim
+            h5.attrs["common_data_version"] = COMMON_DATA_VERSION
             h5.attrs["token_count"] = args.token_count
             init_common_datasets(h5, rows, global_start_id)
             h5.create_dataset(
@@ -186,10 +191,10 @@ def batch_to_records(batch: dict[str, np.ndarray], mode: str) -> list[dict[str, 
         record: dict[str, object] = {
             "pk": row_id,
             "id": row_id,
-            "uuid1": batch["uuid1"][idx].decode("ascii"),
-            "uuid2": batch["uuid2"][idx].decode("ascii"),
-            "platform": batch["platform"][idx].decode("ascii"),
-            "text": batch["text"][idx].decode("ascii"),
+            "uuid1": batch["uuid1"][idx].decode("utf-8"),
+            "uuid2": batch["uuid2"][idx].decode("utf-8"),
+            "platform": batch["platform"][idx].decode("utf-8"),
+            "text": batch["text"][idx].decode("utf-8"),
         }
         matrix = vectors[idx]
         if mode == MODE_STRUCT_FLOAT32:
@@ -210,15 +215,27 @@ def insert_records(args: argparse.Namespace) -> None:
         yield from iter_h5_slices(paths, args.insert_batch_size, ("id", "uuid1", "uuid2", "platform", "text", "vector"))
 
     def worker(batch: dict[str, np.ndarray]) -> OperationResult:
+        worker_start = time.perf_counter()
         records = batch_to_records(batch, args.multi_vector_mode)
+        prep_elapsed = time.perf_counter() - worker_start
         try:
             client = get_thread_client(config)
-            start = time.perf_counter()
+            rpc_start = time.perf_counter()
             client.insert(collection_name=args.collection_name, data=records, timeout=args.timeout)
-            elapsed = time.perf_counter() - start
-            return OperationResult(len(records), 0, elapsed)
+            delete_records = delete_ratio_candidates(records, args.delete_ratio)
+            if delete_records:
+                query_delete_then_insert_records(
+                    client,
+                    collection_name=args.collection_name,
+                    records=delete_records,
+                    timeout=args.timeout,
+                )
+            rpc_elapsed = time.perf_counter() - rpc_start
+            elapsed = time.perf_counter() - worker_start
+            return OperationResult(len(records), 0, elapsed, prep_elapsed=prep_elapsed, rpc_elapsed=rpc_elapsed)
         except Exception as exc:
-            return OperationResult(0, len(records), None, repr(exc))
+            elapsed = time.perf_counter() - worker_start
+            return OperationResult(0, len(records), elapsed, repr(exc), prep_elapsed=prep_elapsed)
 
     result = run_concurrent_operations(
         batches(),
@@ -250,6 +267,7 @@ def insert_records(args: argparse.Namespace) -> None:
             "stored_dtype": "float16",
             "milvus_mode": args.multi_vector_mode,
             "insert_batch_size": args.insert_batch_size,
+            "delete_ratio": args.delete_ratio,
             "concurrency": args.concurrency,
             "index_type": args.index_type,
             "metric_type": args.metric_type if args.multi_vector_mode == MODE_STRUCT_FLOAT32 else args.flat_metric_type,
@@ -273,6 +291,8 @@ def validate_args(args: argparse.Namespace) -> None:
         errors.append(f"--token-count must be positive, got {args.token_count}")
     if args.insert_batch_size <= 0:
         errors.append(f"--insert-batch-size must be positive, got {args.insert_batch_size}")
+    if args.delete_ratio < 0 or args.delete_ratio > 100:
+        errors.append(f"--delete-ratio must be between 0 and 100, got {args.delete_ratio}")
     if args.concurrency <= 0:
         errors.append(f"--concurrency must be positive, got {args.concurrency}")
     if args.hnsw_m <= 0:

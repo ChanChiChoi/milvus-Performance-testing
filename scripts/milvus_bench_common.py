@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import math
 import os
-import random
-import string
 import threading
 import time
+import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,10 +33,10 @@ DEFAULT_DB_NAME = "llmbp"
 DEFAULT_TOTAL_ROWS = 1_000_000
 DEFAULT_SHARD_ROWS = 250_000
 DEFAULT_TIMEOUT = 60.0
-PLATFORMS = np.asarray([b"suning", b"taobao", b"jingdong"], dtype="S8")
-TEXT_ALPHABET = np.frombuffer(
-    (string.ascii_letters + string.digits).encode("ascii"), dtype=np.uint8
-)
+COMMON_DATA_VERSION = 2
+PLATFORMS = np.asarray(["苏宁".encode("utf-8"), "淘宝".encode("utf-8"), "京东".encode("utf-8")], dtype="S16")
+TEXT_CHARS = np.asarray(list("的一是在不了有和人这中大为上个国我以要他时来用们生到作地于出就分对成会可主发年动同工也能下过子说产种面而方后多定行学法所民得经十三之进着等部度家电力里如水化高自二理起小物现实加量都两体制机当使点从业本去把性好应开它合还因由其些然前外天政四日那社义事平形相全表间样与关各重新线内数正心反你明看原又么利比或但质气第向道命此变条只没结解问意建月公无系军很情者最立代想已通并提直题党程展五果料象员革位入常文总次品式活设及管特件长求老头基资边流路级少图山统接知较将组见计别她手角期根论运农指几九区强放决西被干做必战先回则任取据处理世受领"))
+UUID_NAMESPACE = uuid.UUID("7fd54d72-4a67-42df-9ff7-02bf352f7b16")
 
 
 def clear_proxy_env() -> None:
@@ -64,6 +63,8 @@ class OperationResult:
     fail_count: int
     elapsed: float | None = None
     error: str | None = None
+    prep_elapsed: float | None = None
+    rpc_elapsed: float | None = None
 
 
 @dataclass
@@ -71,6 +72,9 @@ class BenchmarkResult:
     ok_count: int
     fail_count: int
     latencies: list[float]
+    prep_latencies: list[float]
+    rpc_latencies: list[float]
+    read_latencies: list[float]
     wall_elapsed: float
     operation_count: int
     successful_operations: int
@@ -248,8 +252,8 @@ def init_common_datasets(h5: h5py.File, rows: int, global_start_id: int) -> None
     h5.create_dataset("id", data=np.arange(global_start_id, global_start_id + rows, dtype=np.int64))
     h5.create_dataset("uuid1", shape=(rows,), dtype="S36")
     h5.create_dataset("uuid2", shape=(rows,), dtype="S36")
-    h5.create_dataset("platform", shape=(rows,), dtype="S8")
-    h5.create_dataset("text", shape=(rows,), dtype="S50")
+    h5.create_dataset("platform", shape=(rows,), dtype="S16")
+    h5.create_dataset("text", shape=(rows,), dtype="S64")
 
 
 def fill_common_datasets(
@@ -261,37 +265,72 @@ def fill_common_datasets(
 ) -> None:
     size = end - start
     ids = np.arange(global_start_id + start, global_start_id + end, dtype=np.int64)
-    h5["uuid1"][start:end] = make_uuid_array(ids, salt=0)
-    h5["uuid2"][start:end] = make_uuid_array(ids, salt=10_000_000_000_000)
+    h5["uuid1"][start:end] = make_uuid_array(ids, salt="uuid1")
+    h5["uuid2"][start:end] = make_uuid_array(ids, salt="uuid2")
     h5["platform"][start:end] = rng.choice(PLATFORMS, size=size)
-    h5["text"][start:end] = make_text_array(rng, size, 50)
+    h5["text"][start:end] = make_text_array(rng, size, 16)
 
 
-def make_uuid_array(ids: np.ndarray, *, salt: int) -> np.ndarray:
+def make_uuid_array(ids: np.ndarray, *, salt: str) -> np.ndarray:
     values: list[bytes] = []
     for value in ids:
-        raw = f"{(int(value) + salt) % (1 << 128):032x}"
-        values.append(
-            f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}".encode(
-                "ascii"
-            )
-        )
+        values.append(str(uuid.uuid5(UUID_NAMESPACE, f"{salt}:{int(value)}")).encode("ascii"))
     return np.asarray(values, dtype="S36")
 
 
 def make_text_array(rng: np.random.Generator, size: int, length: int) -> np.ndarray:
-    indexes = rng.integers(0, len(TEXT_ALPHABET), size=(size, length), dtype=np.int16)
-    chars = TEXT_ALPHABET[indexes]
-    return np.asarray([row.tobytes() for row in chars], dtype=f"S{length}")
+    indexes = rng.integers(0, len(TEXT_CHARS), size=(size, length), dtype=np.int16)
+    return np.asarray(
+        ["".join(TEXT_CHARS[row]).encode("utf-8") for row in indexes],
+        dtype="S64",
+    )
 
 
 def decode_bytes(value: Any) -> str:
     if isinstance(value, bytes):
-        return value.decode("ascii")
+        return value.decode("utf-8")
     if hasattr(value, "decode"):
-        return value.decode("ascii")
+        return value.decode("utf-8")
     return str(value)
 
+
+
+
+def milvus_string_literal(value: object) -> str:
+    text = str(value)
+    return chr(34) + text.replace(chr(92), chr(92) + chr(92)).replace(chr(34), chr(92) + chr(34)) + chr(34)
+
+
+def record_delete_filter(record: dict[str, object]) -> str:
+    uuid1 = milvus_string_literal(record["uuid1"])
+    text = milvus_string_literal(record["text"])
+    return f"uuid1 == {uuid1} and text == {text}"
+
+
+def delete_ratio_candidates(records: list[dict[str, object]], delete_ratio: int) -> list[dict[str, object]]:
+    if delete_ratio <= 0:
+        return []
+    return [record for record in records if (int(record["id"]) - 1) % 100 >= 100 - delete_ratio]
+
+
+def query_delete_then_insert_records(
+    client: MilvusClient,
+    *,
+    collection_name: str,
+    records: list[dict[str, object]],
+    timeout: float,
+) -> tuple[int, int]:
+    found_count = 0
+    deleted_count = 0
+    for record in records:
+        expr = record_delete_filter(record)
+        rows = client.query(collection_name=collection_name, filter=expr, output_fields=["uuid1", "text"], timeout=timeout)
+        found_count += len(rows or [])
+        client.delete(collection_name=collection_name, filter=expr, timeout=timeout)
+        deleted_count += 1
+    if records:
+        client.insert(collection_name=collection_name, data=records, timeout=timeout)
+    return found_count, deleted_count
 
 def iter_h5_slices(paths: Iterable[Path], batch_size: int, dataset_names: tuple[str, ...]) -> Iterator[dict[str, Any]]:
     for path in paths:
@@ -299,7 +338,10 @@ def iter_h5_slices(paths: Iterable[Path], batch_size: int, dataset_names: tuple[
             rows = int(h5.attrs["rows"])
             for start in range(0, rows, batch_size):
                 end = min(start + batch_size, rows)
-                yield {name: h5[name][start:end] for name in dataset_names}
+                read_start = time.perf_counter()
+                batch = {name: h5[name][start:end] for name in dataset_names}
+                batch["_read_elapsed"] = time.perf_counter() - read_start
+                yield batch
 
 
 def remove_tmp_and_replace(tmp_path: Path, final_path: Path) -> None:
@@ -323,6 +365,9 @@ def run_concurrent_operations(
     successful_operations = 0
     failed_operations = 0
     latencies: list[float] = []
+    prep_latencies: list[float] = []
+    rpc_latencies: list[float] = []
+    read_latencies: list[float] = []
     pending: set[Any] = set()
     max_pending = max(1, concurrency * 2)
     wall_start = time.perf_counter()
@@ -339,6 +384,10 @@ def run_concurrent_operations(
             fail_count += result.fail_count
             if result.elapsed is not None and result.ok_count > 0:
                 latencies.append(result.elapsed)
+            if result.prep_elapsed is not None and result.ok_count > 0:
+                prep_latencies.append(result.prep_elapsed)
+            if result.rpc_elapsed is not None and result.ok_count > 0:
+                rpc_latencies.append(result.rpc_elapsed)
             if result.fail_count > 0 or result.error:
                 failed_operations += 1
             else:
@@ -352,6 +401,10 @@ def run_concurrent_operations(
             for batch in batches:
                 if unit_count(batch) <= 0:
                     continue
+                if isinstance(batch, dict):
+                    read_elapsed = batch.get("_read_elapsed")
+                    if read_elapsed is not None:
+                        read_latencies.append(float(read_elapsed))
                 while len(pending) >= max_pending:
                     done, pending = wait(pending, return_when=FIRST_COMPLETED)
                     collect(done, pbar)
@@ -365,6 +418,9 @@ def run_concurrent_operations(
         ok_count=ok_count,
         fail_count=fail_count,
         latencies=latencies,
+        prep_latencies=prep_latencies,
+        rpc_latencies=rpc_latencies,
+        read_latencies=read_latencies,
         wall_elapsed=wall_elapsed,
         operation_count=operation_count,
         successful_operations=successful_operations,
@@ -412,11 +468,46 @@ def print_result_table(
             ("TP99(s)", f"{stats['TP99']:.6f}"),
         ]
     )
+    if result.read_latencies:
+        read_stats = percentile_stats(result.read_latencies)
+        rows.extend(
+            [
+                ("read_latency_samples", str(len(result.read_latencies))),
+                ("read_TP50(s)", f"{read_stats['TP50']:.6f}"),
+                ("read_TP90(s)", f"{read_stats['TP90']:.6f}"),
+                ("read_TP99(s)", f"{read_stats['TP99']:.6f}"),
+            ]
+        )
+    if result.prep_latencies:
+        prep_stats = percentile_stats(result.prep_latencies)
+        rows.extend(
+            [
+                ("prep_latency_samples", str(len(result.prep_latencies))),
+                ("prep_TP50(s)", f"{prep_stats['TP50']:.6f}"),
+                ("prep_TP90(s)", f"{prep_stats['TP90']:.6f}"),
+                ("prep_TP99(s)", f"{prep_stats['TP99']:.6f}"),
+            ]
+        )
+    if result.rpc_latencies:
+        rpc_stats = percentile_stats(result.rpc_latencies)
+        rows.extend(
+            [
+                ("rpc_latency_samples", str(len(result.rpc_latencies))),
+                ("rpc_TP50(s)", f"{rpc_stats['TP50']:.6f}"),
+                ("rpc_TP90(s)", f"{rpc_stats['TP90']:.6f}"),
+                ("rpc_TP99(s)", f"{rpc_stats['TP99']:.6f}"),
+            ]
+        )
     width = max(len(k) for k, _ in rows + [(title, "")])
     print("\n" + title)
     print("-" * (width + 22))
     for key, value in rows:
         print(f"{key:<{width}} | {value}")
+    print()
+    print("结果解读提示")
+    print("- 如果 read_* 较高，且 wall_elapsed 对 concurrency 变化不敏感，多半是本地磁盘或 HDF5 串行读取成为瓶颈。")
+    print("- 如果 prep_* 较高，尤其是多向量写入，说明 Python 构造 token 对象和 float32 转换可能受 CPU 或 GIL 限制。")
+    print("- 如果 rpc_* 较高，并且 concurrency 增加后 rpc_TP* 上升但吞吐不涨，说明 Milvus、网络、Proxy 或 DataNode 可能已经打满。")
 
 
 def timed_call(fn: Callable[[], Any]) -> tuple[Any, float]:
