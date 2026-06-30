@@ -14,6 +14,8 @@ import numpy as np
 from pymilvus.client.embedding_list import EmbeddingList
 
 from milvus_bench_common import (
+    H5SliceSpec,
+    MilvusConfig,
     OperationResult,
     add_connection_args,
     config_from_args,
@@ -35,6 +37,99 @@ MODE_STRUCT_FLOAT32 = "struct-float32"
 MODE_FLAT_FP16 = "flat-fp16"
 
 
+_PROCESS_STATE: dict[str, object] = {}
+
+
+def init_process_worker(config: MilvusConfig, target: str, single_collection: str, multi_collection: str, id_filter: str, limit: int, search_ef: int, timeout: float, single_metric_type: str, multi_metric_type: str, flat_metric_type: str, multi_vector_mode: str, multi_vector_dim: int) -> None:
+    _PROCESS_STATE.clear()
+    _PROCESS_STATE.update(
+        {
+            "config": config,
+            "target": target,
+            "single_collection": single_collection,
+            "multi_collection": multi_collection,
+            "id_filter": id_filter,
+            "limit": limit,
+            "search_ef": search_ef,
+            "timeout": timeout,
+            "single_metric_type": single_metric_type,
+            "multi_metric_type": multi_metric_type,
+            "flat_metric_type": flat_metric_type,
+            "multi_vector_mode": multi_vector_mode,
+            "multi_vector_dim": multi_vector_dim,
+        }
+    )
+
+
+def process_query_worker(spec: H5SliceSpec) -> list[OperationResult]:
+    state = _PROCESS_STATE
+    results: list[OperationResult] = []
+    read_start = time.perf_counter()
+    with h5py.File(spec.path, "r") as h5:
+        ids = h5["id"][spec.start:spec.end]
+        single = h5["single_vector"][spec.start:spec.end]
+        multi = h5["multi_vector"][spec.start:spec.end]
+    read_elapsed_per_sample = (time.perf_counter() - read_start) / max(1, spec.rows)
+    client = get_thread_client(state["config"])  # type: ignore[arg-type]
+    for idx in range(spec.rows):
+        worker_start = time.perf_counter()
+        sample_id = int(ids[idx])
+        expr = filter_expr(sample_id, state["id_filter"])  # type: ignore[arg-type]
+        prep_start = time.perf_counter()
+        single_data = [single[idx].copy()] if state["target"] in ("single", "both") else None  # type: ignore[index]
+        multi_data = None
+        if state["target"] in ("multi", "both"):
+            multi_matrix = multi[idx].copy()
+            if state["multi_vector_mode"] == MODE_STRUCT_FLOAT32:  # type: ignore[index]
+                multi_data = [EmbeddingList(multi_matrix.astype(np.float32, copy=False), dim=state["multi_vector_dim"], dtype="float32")]  # type: ignore[index]
+            else:
+                multi_data = [multi_matrix.reshape(-1)]
+        prep_elapsed = time.perf_counter() - prep_start
+        try:
+            rpc_start = time.perf_counter()
+            if single_data is not None:
+                client.search(
+                    collection_name=state["single_collection"],  # type: ignore[index]
+                    data=single_data,
+                    anns_field="vector",
+                    filter=expr,
+                    limit=state["limit"],  # type: ignore[index]
+                    output_fields=["id", "platform"],
+                    search_params={"metric_type": state["single_metric_type"], "params": {"ef": state["search_ef"]}},  # type: ignore[index]
+                    timeout=state["timeout"],  # type: ignore[index]
+                )
+            if multi_data is not None:
+                if state["multi_vector_mode"] == MODE_STRUCT_FLOAT32:  # type: ignore[index]
+                    client.search(
+                        collection_name=state["multi_collection"],  # type: ignore[index]
+                        data=multi_data,
+                        anns_field="tokens[token_vector]",
+                        filter=expr,
+                        limit=state["limit"],  # type: ignore[index]
+                        output_fields=["id", "platform"],
+                        search_params={"metric_type": state["multi_metric_type"], "params": {"ef": state["search_ef"]}},  # type: ignore[index]
+                        timeout=state["timeout"],  # type: ignore[index]
+                    )
+                else:
+                    client.search(
+                        collection_name=state["multi_collection"],  # type: ignore[index]
+                        data=multi_data,
+                        anns_field="vector",
+                        filter=expr,
+                        limit=state["limit"],  # type: ignore[index]
+                        output_fields=["id", "platform"],
+                        search_params={"metric_type": state["flat_metric_type"], "params": {"ef": state["search_ef"]}},  # type: ignore[index]
+                        timeout=state["timeout"],  # type: ignore[index]
+                    )
+            rpc_elapsed = time.perf_counter() - rpc_start
+            elapsed = time.perf_counter() - worker_start
+            results.append(OperationResult(1, 0, elapsed, read_elapsed=read_elapsed_per_sample, prep_elapsed=prep_elapsed, rpc_elapsed=rpc_elapsed))
+        except Exception as exc:
+            elapsed = time.perf_counter() - worker_start
+            results.append(OperationResult(0, 1, elapsed, repr(exc), read_elapsed=read_elapsed_per_sample, prep_elapsed=prep_elapsed))
+    return results
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Milvus search benchmark for single and multi vectors")
     add_connection_args(parser)
@@ -54,6 +149,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-token-count", type=int, default=30)
     parser.add_argument("--data-id-max", type=int, default=1_000_000)
     parser.add_argument("--query-read-batch-size", type=int, default=512)
+    parser.add_argument("--prefetch-batches", type=int, default=0, help="Read this many query batches ahead; 0 uses concurrency * 2")
+    parser.add_argument("--executor-kind", choices=["thread", "process"], default="thread", help="Use threads or processes for the worker pool")
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--limit", type=int, default=4000)
     parser.add_argument("--single-metric-type", default="COSINE")
@@ -138,14 +235,17 @@ def iter_query_samples(paths: list[Path], batch_size: int):
             rows = int(h5.attrs["rows"])
             for start in range(0, rows, batch_size):
                 end = min(start + batch_size, rows)
+                read_start = time.perf_counter()
                 ids = h5["id"][start:end]
                 single = h5["single_vector"][start:end]
                 multi = h5["multi_vector"][start:end]
+                read_elapsed_per_sample = (time.perf_counter() - read_start) / max(1, end - start)
                 for idx in range(end - start):
                     yield {
                         "id": int(ids[idx]),
                         "single_vector": single[idx].copy(),
                         "multi_vector": multi[idx].copy(),
+                        "_read_elapsed": read_elapsed_per_sample,
                     }
 
 
@@ -212,61 +312,103 @@ def run_queries(args: argparse.Namespace) -> None:
     validate_query_shards(args, paths)
     total_rows = sum(h5_rows(path) for path in paths)
 
-    def worker(sample: dict[str, object]) -> OperationResult:
-        client = get_thread_client(config)
-        sample_id = int(sample["id"])
-        expr = filter_expr(sample_id, args.id_filter)
-        try:
-            start = time.perf_counter()
-            if args.target in ("single", "both"):
-                client.search(
-                    collection_name=args.single_collection,
-                    data=[sample["single_vector"]],
-                    anns_field="vector",
-                    filter=expr,
-                    limit=args.limit,
-                    output_fields=["id", "platform"],
-                    search_params={"metric_type": args.single_metric_type, "params": {"ef": args.search_ef}},
-                    timeout=args.timeout,
-                )
+    prefetch_batches = args.prefetch_batches if args.prefetch_batches > 0 else args.concurrency * 2
+
+    if args.executor_kind == "process":
+        batches = iter_h5_slice_specs(paths, args.query_read_batch_size)
+        result = run_concurrent_operations(
+            batches,
+            total_units=total_rows,
+            concurrency=args.concurrency,
+            worker=process_query_worker,
+            unit_count=lambda spec: spec.rows,
+            description="query",
+            prefetch_batches=prefetch_batches,
+            executor_kind="process",
+            executor_initializer=init_process_worker,
+            executor_initargs=(
+                config,
+                args.target,
+                args.single_collection,
+                args.multi_collection,
+                args.id_filter,
+                args.limit,
+                args.search_ef,
+                args.timeout,
+                args.single_metric_type,
+                args.multi_metric_type,
+                args.flat_metric_type,
+                args.multi_vector_mode,
+                args.multi_vector_dim,
+            ),
+        )
+    else:
+        def worker(sample: dict[str, object]) -> OperationResult:
+            worker_start = time.perf_counter()
+            client = get_thread_client(config)
+            sample_id = int(sample["id"])
+            expr = filter_expr(sample_id, args.id_filter)
+            single_data = [sample["single_vector"]] if args.target in ("single", "both") else None
+            multi_data = None
             if args.target in ("multi", "both"):
-                matrix = sample["multi_vector"]
+                multi_matrix = sample["multi_vector"]
                 if args.multi_vector_mode == MODE_STRUCT_FLOAT32:
-                    query = EmbeddingList(matrix.astype(np.float32, copy=False), dim=args.multi_vector_dim, dtype="float32")
-                    client.search(
-                        collection_name=args.multi_collection,
-                        data=[query],
-                        anns_field="tokens[token_vector]",
-                        filter=expr,
-                        limit=args.limit,
-                        output_fields=["id", "platform"],
-                        search_params={"metric_type": args.multi_metric_type, "params": {"ef": args.search_ef}},
-                        timeout=args.timeout,
-                    )
+                    multi_data = [EmbeddingList(multi_matrix.astype(np.float32, copy=False), dim=args.multi_vector_dim, dtype="float32")]
                 else:
+                    multi_data = [multi_matrix.reshape(-1)]
+            prep_elapsed = time.perf_counter() - worker_start
+            try:
+                rpc_start = time.perf_counter()
+                if single_data is not None:
                     client.search(
-                        collection_name=args.multi_collection,
-                        data=[matrix.reshape(-1)],
+                        collection_name=args.single_collection,
+                        data=single_data,
                         anns_field="vector",
                         filter=expr,
                         limit=args.limit,
                         output_fields=["id", "platform"],
-                        search_params={"metric_type": args.flat_metric_type, "params": {"ef": args.search_ef}},
+                        search_params={"metric_type": args.single_metric_type, "params": {"ef": args.search_ef}},
                         timeout=args.timeout,
                     )
-            elapsed = time.perf_counter() - start
-            return OperationResult(1, 0, elapsed)
-        except Exception as exc:
-            return OperationResult(0, 1, None, repr(exc))
+                if multi_data is not None:
+                    if args.multi_vector_mode == MODE_STRUCT_FLOAT32:
+                        client.search(
+                            collection_name=args.multi_collection,
+                            data=multi_data,
+                            anns_field="tokens[token_vector]",
+                            filter=expr,
+                            limit=args.limit,
+                            output_fields=["id", "platform"],
+                            search_params={"metric_type": args.multi_metric_type, "params": {"ef": args.search_ef}},
+                            timeout=args.timeout,
+                        )
+                    else:
+                        client.search(
+                            collection_name=args.multi_collection,
+                            data=multi_data,
+                            anns_field="vector",
+                            filter=expr,
+                            limit=args.limit,
+                            output_fields=["id", "platform"],
+                            search_params={"metric_type": args.flat_metric_type, "params": {"ef": args.search_ef}},
+                            timeout=args.timeout,
+                        )
+                rpc_elapsed = time.perf_counter() - rpc_start
+                elapsed = time.perf_counter() - worker_start
+                return OperationResult(1, 0, elapsed, prep_elapsed=prep_elapsed, rpc_elapsed=rpc_elapsed)
+            except Exception as exc:
+                elapsed = time.perf_counter() - worker_start
+                return OperationResult(0, 1, elapsed, repr(exc), prep_elapsed=prep_elapsed)
 
-    result = run_concurrent_operations(
-        iter_query_samples(paths, args.query_read_batch_size),
-        total_units=total_rows,
-        concurrency=args.concurrency,
-        worker=worker,
-        unit_count=lambda _sample: 1,
-        description="query",
-    )
+        result = run_concurrent_operations(
+            iter_query_samples(paths, args.query_read_batch_size),
+            total_units=total_rows,
+            concurrency=args.concurrency,
+            worker=worker,
+            unit_count=lambda _sample: 1,
+            description="query",
+            prefetch_batches=prefetch_batches,
+        )
     print_result_table(
         "query result",
         result,
@@ -285,6 +427,8 @@ def run_queries(args: argparse.Namespace) -> None:
             "multi_vector_mode": args.multi_vector_mode,
             "query_read_batch_size": args.query_read_batch_size,
             "concurrency": args.concurrency,
+            "prefetch_batches": prefetch_batches,
+            "executor_kind": args.executor_kind,
             "limit": args.limit,
             "search_ef": args.search_ef,
             "id_filter": args.id_filter,
@@ -306,6 +450,8 @@ def validate_args(args: argparse.Namespace) -> None:
         errors.append(f"--query-token-count must be positive, got {args.query_token_count}")
     if args.concurrency <= 0:
         errors.append(f"--concurrency must be positive, got {args.concurrency}")
+    if args.prefetch_batches < 0:
+        errors.append(f"--prefetch-batches must be >= 0, got {args.prefetch_batches}")
     if args.limit <= 0:
         errors.append(f"--limit must be positive, got {args.limit}")
     if not args.generate_only and args.search_ef < args.limit:

@@ -15,6 +15,8 @@ from pymilvus import DataType
 
 from milvus_bench_common import (
     COMMON_DATA_VERSION,
+    H5SliceSpec,
+    MilvusConfig,
     OperationResult,
     delete_ratio_candidates,
     add_connection_args,
@@ -26,6 +28,7 @@ from milvus_bench_common import (
     get_thread_client,
     h5_rows,
     init_common_datasets,
+    iter_h5_slice_specs,
     iter_h5_slices,
     make_client,
     maybe_flush,
@@ -42,6 +45,52 @@ MODE_STRUCT_FLOAT32 = "struct-float32"
 MODE_FLAT_FP16 = "flat-fp16"
 
 
+_PROCESS_STATE: dict[str, object] = {}
+
+
+def init_process_worker(config: MilvusConfig, collection_name: str, delete_ratio: int, timeout: float, mode: str) -> None:
+    _PROCESS_STATE.clear()
+    _PROCESS_STATE.update(
+        {
+            "config": config,
+            "collection_name": collection_name,
+            "delete_ratio": delete_ratio,
+            "timeout": timeout,
+            "mode": mode,
+        }
+    )
+
+
+def process_insert_worker(spec: H5SliceSpec) -> OperationResult:
+    state = _PROCESS_STATE
+    worker_start = time.perf_counter()
+    read_start = worker_start
+    with h5py.File(spec.path, "r") as h5:
+        batch = {name: h5[name][spec.start:spec.end] for name in ("id", "uuid1", "uuid2", "platform", "text", "vector")}
+    read_elapsed = time.perf_counter() - read_start
+    prep_start = time.perf_counter()
+    records = batch_to_records(batch, state["mode"])  # type: ignore[arg-type]
+    prep_elapsed = time.perf_counter() - prep_start
+    try:
+        client = get_thread_client(state["config"])  # type: ignore[arg-type]
+        rpc_start = time.perf_counter()
+        client.insert(collection_name=state["collection_name"], data=records, timeout=state["timeout"])  # type: ignore[index]
+        delete_records = delete_ratio_candidates(records, state["delete_ratio"])  # type: ignore[arg-type]
+        if delete_records:
+            query_delete_then_insert_records(
+                client,
+                collection_name=state["collection_name"],  # type: ignore[index]
+                records=delete_records,
+                timeout=state["timeout"],  # type: ignore[index]
+            )
+        rpc_elapsed = time.perf_counter() - rpc_start
+        elapsed = time.perf_counter() - worker_start
+        return OperationResult(len(records), 0, elapsed, read_elapsed=read_elapsed, prep_elapsed=prep_elapsed, rpc_elapsed=rpc_elapsed)
+    except Exception as exc:
+        elapsed = time.perf_counter() - worker_start
+        return OperationResult(0, len(records), elapsed, repr(exc), read_elapsed=read_elapsed, prep_elapsed=prep_elapsed)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Insert benchmark for ColBERT-style multi vectors")
     add_connection_args(parser)
@@ -52,6 +101,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vector-dim", type=int, default=128)
     parser.add_argument("--token-count", type=int, default=300)
     parser.add_argument("--insert-batch-size", type=int, default=8)
+    parser.add_argument("--executor-kind", choices=["thread", "process"], default="thread", help="Use threads or processes for the worker pool")
+    parser.add_argument("--prefetch-batches", type=int, default=0, help="Read this many HDF5 batches ahead; 0 uses concurrency * 2")
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--multi-vector-mode", choices=[MODE_STRUCT_FLOAT32, MODE_FLAT_FP16], default=MODE_STRUCT_FLOAT32)
     parser.add_argument("--metric-type", default="MAX_SIM_COSINE", help="Metric for struct-float32 mode")
@@ -135,6 +186,16 @@ def create_collection(args: argparse.Namespace) -> None:
         schema.add_field("text", DataType.VARCHAR, max_length=64)
 
         index_params = client.prepare_index_params()
+        index_params.add_index(
+            field_name="uuid1",
+            index_name="uuid1_inverted_idx",
+            index_type="INVERTED",
+        )
+        index_params.add_index(
+            field_name="uuid2",
+            index_name="uuid2_inverted_idx",
+            index_type="INVERTED",
+        )
         if args.multi_vector_mode == MODE_STRUCT_FLOAT32:
             struct_schema = client.create_struct_field_schema()
             struct_schema.add_field("token_vector", DataType.FLOAT_VECTOR, dim=args.vector_dim)
@@ -183,26 +244,31 @@ def create_collection(args: argparse.Namespace) -> None:
 
 
 def batch_to_records(batch: dict[str, np.ndarray], mode: str) -> list[dict[str, object]]:
-    records: list[dict[str, object]] = []
     ids = batch["id"]
+    uuid1 = batch["uuid1"]
+    uuid2 = batch["uuid2"]
+    platform = batch["platform"]
+    text = batch["text"]
     vectors = batch["vector"]
-    for idx in range(len(ids)):
+    size = len(ids)
+    records: list[dict[str, object]] = [None] * size  # type: ignore[list-item]
+    for idx in range(size):
         row_id = int(ids[idx])
         record: dict[str, object] = {
             "pk": row_id,
             "id": row_id,
-            "uuid1": batch["uuid1"][idx].decode("utf-8"),
-            "uuid2": batch["uuid2"][idx].decode("utf-8"),
-            "platform": batch["platform"][idx].decode("utf-8"),
-            "text": batch["text"][idx].decode("utf-8"),
+            "uuid1": uuid1[idx].decode("utf-8"),
+            "uuid2": uuid2[idx].decode("utf-8"),
+            "platform": platform[idx].decode("utf-8"),
+            "text": text[idx].decode("utf-8"),
         }
         matrix = vectors[idx]
         if mode == MODE_STRUCT_FLOAT32:
             matrix32 = matrix.astype(np.float32, copy=False)
-            record["tokens"] = [{"token_vector": matrix32[token_idx]} for token_idx in range(matrix32.shape[0])]
+            record["tokens"] = [{"token_vector": token} for token in matrix32]
         else:
             record["vector"] = matrix.reshape(-1)
-        records.append(record)
+        records[idx] = record
     return records
 
 
@@ -210,41 +276,59 @@ def insert_records(args: argparse.Namespace) -> None:
     config = config_from_args(args)
     paths = expected_shard_paths(args.data_dir, args.total_rows, args.shard_rows)
     total_rows = sum(h5_rows(path) for path in paths)
+    prefetch_batches = args.prefetch_batches if args.prefetch_batches > 0 else args.concurrency * 2
 
-    def batches() -> object:
-        yield from iter_h5_slices(paths, args.insert_batch_size, ("id", "uuid1", "uuid2", "platform", "text", "vector"))
+    if args.executor_kind == "process":
+        batches = iter_h5_slice_specs(paths, args.insert_batch_size)
+        result = run_concurrent_operations(
+            batches,
+            total_units=total_rows,
+            concurrency=args.concurrency,
+            worker=process_insert_worker,
+            unit_count=lambda spec: spec.rows,
+            description="insert multi",
+            prefetch_batches=prefetch_batches,
+            executor_kind="process",
+            executor_initializer=init_process_worker,
+            executor_initargs=(config, args.collection_name, args.delete_ratio, args.timeout, args.multi_vector_mode),
+        )
+    else:
+        def batches() -> object:
+            yield from iter_h5_slices(paths, args.insert_batch_size, ("id", "uuid1", "uuid2", "platform", "text", "vector"))
 
-    def worker(batch: dict[str, np.ndarray]) -> OperationResult:
-        worker_start = time.perf_counter()
-        records = batch_to_records(batch, args.multi_vector_mode)
-        prep_elapsed = time.perf_counter() - worker_start
-        try:
-            client = get_thread_client(config)
-            rpc_start = time.perf_counter()
-            client.insert(collection_name=args.collection_name, data=records, timeout=args.timeout)
-            delete_records = delete_ratio_candidates(records, args.delete_ratio)
-            if delete_records:
-                query_delete_then_insert_records(
-                    client,
-                    collection_name=args.collection_name,
-                    records=delete_records,
-                    timeout=args.timeout,
-                )
-            rpc_elapsed = time.perf_counter() - rpc_start
-            elapsed = time.perf_counter() - worker_start
-            return OperationResult(len(records), 0, elapsed, prep_elapsed=prep_elapsed, rpc_elapsed=rpc_elapsed)
-        except Exception as exc:
-            elapsed = time.perf_counter() - worker_start
-            return OperationResult(0, len(records), elapsed, repr(exc), prep_elapsed=prep_elapsed)
+        def worker(batch: dict[str, np.ndarray]) -> OperationResult:
+            worker_start = time.perf_counter()
+            records = batch_to_records(batch, args.multi_vector_mode)
+            prep_elapsed = time.perf_counter() - worker_start
+            try:
+                client = get_thread_client(config)
+                rpc_start = time.perf_counter()
+                client.insert(collection_name=args.collection_name, data=records, timeout=args.timeout)
+                delete_records = delete_ratio_candidates(records, args.delete_ratio)
+                if delete_records:
+                    query_delete_then_insert_records(
+                        client,
+                        collection_name=args.collection_name,
+                        records=delete_records,
+                        timeout=args.timeout,
+                    )
+                rpc_elapsed = time.perf_counter() - rpc_start
+                elapsed = time.perf_counter() - worker_start
+                return OperationResult(len(records), 0, elapsed, prep_elapsed=prep_elapsed, rpc_elapsed=rpc_elapsed)
+            except Exception as exc:
+                elapsed = time.perf_counter() - worker_start
+                return OperationResult(0, len(records), elapsed, repr(exc), prep_elapsed=prep_elapsed)
 
-    result = run_concurrent_operations(
-        batches(),
-        total_units=total_rows,
-        concurrency=args.concurrency,
-        worker=worker,
-        unit_count=lambda batch: len(batch["id"]),
-        description="insert multi",
-    )
+        result = run_concurrent_operations(
+            batches(),
+            total_units=total_rows,
+            concurrency=args.concurrency,
+            worker=worker,
+            unit_count=lambda batch: len(batch["id"]),
+            description="insert multi",
+            prefetch_batches=prefetch_batches,
+        )
+
     client = make_client(config)
     try:
         maybe_flush(client, args.collection_name, args.timeout)
@@ -269,6 +353,8 @@ def insert_records(args: argparse.Namespace) -> None:
             "insert_batch_size": args.insert_batch_size,
             "delete_ratio": args.delete_ratio,
             "concurrency": args.concurrency,
+            "prefetch_batches": prefetch_batches,
+            "executor_kind": args.executor_kind,
             "index_type": args.index_type,
             "metric_type": args.metric_type if args.multi_vector_mode == MODE_STRUCT_FLOAT32 else args.flat_metric_type,
         },
@@ -295,6 +381,8 @@ def validate_args(args: argparse.Namespace) -> None:
         errors.append(f"--delete-ratio must be between 0 and 100, got {args.delete_ratio}")
     if args.concurrency <= 0:
         errors.append(f"--concurrency must be positive, got {args.concurrency}")
+    if args.prefetch_batches < 0:
+        errors.append(f"--prefetch-batches must be >= 0, got {args.prefetch_batches}")
     if args.hnsw_m <= 0:
         errors.append(f"--hnsw-m must be positive, got {args.hnsw_m}")
     if args.hnsw_ef_construction <= 0:

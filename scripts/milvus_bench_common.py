@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import math
+import multiprocessing as mp
 import os
 import threading
 import time
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from collections.abc import Sequence
 from dataclasses import dataclass
+from queue import Queue
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -63,6 +66,7 @@ class OperationResult:
     fail_count: int
     elapsed: float | None = None
     error: str | None = None
+    read_elapsed: float | None = None
     prep_elapsed: float | None = None
     rpc_elapsed: float | None = None
 
@@ -86,7 +90,8 @@ class BenchmarkResult:
 
     @property
     def success_rate(self) -> float:
-        return self.ok_count / self.total_count if self.total_count else 0.0
+        total = self.total_count
+        return self.ok_count / total if total else 0.0
 
     @property
     def success_rows_per_second(self) -> float:
@@ -99,6 +104,14 @@ class BenchmarkResult:
     @property
     def operations_per_second(self) -> float:
         return self.operation_count / self.wall_elapsed if self.wall_elapsed > 0 else 0.0
+
+
+@dataclass(frozen=True)
+class H5SliceSpec:
+    path: Path
+    start: int
+    end: int
+    rows: int
 
 
 _thread_local = threading.local()
@@ -303,8 +316,8 @@ def milvus_string_literal(value: object) -> str:
 
 def record_delete_filter(record: dict[str, object]) -> str:
     uuid1 = milvus_string_literal(record["uuid1"])
-    text = milvus_string_literal(record["text"])
-    return f"uuid1 == {uuid1} and text == {text}"
+    uuid2 = milvus_string_literal(record["uuid2"])
+    return f"uuid1 == {uuid1} and uuid2 == {uuid2}"
 
 
 def delete_ratio_candidates(records: list[dict[str, object]], delete_ratio: int) -> list[dict[str, object]]:
@@ -324,13 +337,22 @@ def query_delete_then_insert_records(
     deleted_count = 0
     for record in records:
         expr = record_delete_filter(record)
-        rows = client.query(collection_name=collection_name, filter=expr, output_fields=["uuid1", "text"], timeout=timeout)
+        rows = client.query(collection_name=collection_name, filter=expr, output_fields=["uuid1", "uuid2"], timeout=timeout)
         found_count += len(rows or [])
         client.delete(collection_name=collection_name, filter=expr, timeout=timeout)
         deleted_count += 1
     if records:
         client.insert(collection_name=collection_name, data=records, timeout=timeout)
     return found_count, deleted_count
+
+def iter_h5_slice_specs(paths: Iterable[Path], batch_size: int) -> Iterator[H5SliceSpec]:
+    for path in paths:
+        with h5py.File(path, "r") as h5:
+            rows = int(h5.attrs["rows"])
+            for start in range(0, rows, batch_size):
+                end = min(start + batch_size, rows)
+                yield H5SliceSpec(path=path, start=start, end=end, rows=end - start)
+
 
 def iter_h5_slices(paths: Iterable[Path], batch_size: int, dataset_names: tuple[str, ...]) -> Iterator[dict[str, Any]]:
     for path in paths:
@@ -350,6 +372,34 @@ def remove_tmp_and_replace(tmp_path: Path, final_path: Path) -> None:
     tmp_path.replace(final_path)
 
 
+def prefetch_iterable(batches: Iterable[Any], max_prefetch: int) -> Iterator[Any]:
+    if max_prefetch <= 0:
+        yield from batches
+        return
+
+    queue: Queue[tuple[str, Any]] = Queue(maxsize=max_prefetch)
+
+    def producer() -> None:
+        try:
+            for batch in batches:
+                queue.put(("item", batch))
+        except BaseException as exc:
+            queue.put(("error", exc))
+        finally:
+            queue.put(("done", None))
+
+    thread = threading.Thread(target=producer, name="h5-prefetch", daemon=True)
+    thread.start()
+    while True:
+        kind, value = queue.get()
+        if kind == "item":
+            yield value
+        elif kind == "error":
+            raise value
+        else:
+            return
+
+
 def run_concurrent_operations(
     batches: Iterable[Any],
     *,
@@ -358,6 +408,10 @@ def run_concurrent_operations(
     worker: Callable[[Any], OperationResult],
     unit_count: Callable[[Any], int],
     description: str,
+    prefetch_batches: int = 0,
+    executor_kind: str = "thread",
+    executor_initializer: Callable[..., None] | None = None,
+    executor_initargs: tuple[Any, ...] = (),
 ) -> BenchmarkResult:
     ok_count = 0
     fail_count = 0
@@ -376,29 +430,47 @@ def run_concurrent_operations(
         nonlocal ok_count, fail_count, operation_count, successful_operations, failed_operations
         for future in done:
             try:
-                result = future.result()
+                future_result = future.result()
             except Exception as exc:
-                result = OperationResult(0, 0, None, repr(exc))
-            operation_count += 1
-            ok_count += result.ok_count
-            fail_count += result.fail_count
-            if result.elapsed is not None and result.ok_count > 0:
-                latencies.append(result.elapsed)
-            if result.prep_elapsed is not None and result.ok_count > 0:
-                prep_latencies.append(result.prep_elapsed)
-            if result.rpc_elapsed is not None and result.ok_count > 0:
-                rpc_latencies.append(result.rpc_elapsed)
-            if result.fail_count > 0 or result.error:
-                failed_operations += 1
+                future_result = OperationResult(0, 0, None, repr(exc))
+            if isinstance(future_result, Sequence) and not isinstance(future_result, (bytes, str)):
+                results = list(future_result)
             else:
-                successful_operations += 1
-            pbar.update(result.ok_count + result.fail_count)
-            if result.error:
-                tqdm.write(result.error)
+                results = [future_result]
+            for result in results:
+                operation_count += 1
+                ok_count += result.ok_count
+                fail_count += result.fail_count
+                if result.elapsed is not None and result.ok_count > 0:
+                    latencies.append(result.elapsed)
+                if result.read_elapsed is not None and result.ok_count > 0:
+                    read_latencies.append(result.read_elapsed)
+                if result.prep_elapsed is not None and result.ok_count > 0:
+                    prep_latencies.append(result.prep_elapsed)
+                if result.rpc_elapsed is not None and result.ok_count > 0:
+                    rpc_latencies.append(result.rpc_elapsed)
+                if result.fail_count > 0 or result.error:
+                    failed_operations += 1
+                else:
+                    successful_operations += 1
+                if result.error:
+                    tqdm.write(result.error)
+            pbar.update(sum(r.ok_count + r.fail_count for r in results))
 
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+    executor_cls: type[ThreadPoolExecutor] | type[ProcessPoolExecutor]
+    executor_kwargs: dict[str, Any] = {"max_workers": max(1, concurrency)}
+    if executor_kind == "process":
+        executor_cls = ProcessPoolExecutor
+        executor_kwargs["mp_context"] = mp.get_context("spawn")
+    else:
+        executor_cls = ThreadPoolExecutor
+    if executor_initializer is not None:
+        executor_kwargs["initializer"] = executor_initializer
+        if executor_initargs:
+            executor_kwargs["initargs"] = executor_initargs
+    with executor_cls(**executor_kwargs) as executor:
         with tqdm(total=total_units, desc=description, unit="row") as pbar:
-            for batch in batches:
+            for batch in prefetch_iterable(batches, prefetch_batches):
                 if unit_count(batch) <= 0:
                     continue
                 if isinstance(batch, dict):
@@ -468,6 +540,9 @@ def print_result_table(
             ("TP99(s)", f"{stats['TP99']:.6f}"),
         ]
     )
+    has_helper_metrics = bool(result.read_latencies or result.prep_latencies or result.rpc_latencies)
+    if has_helper_metrics:
+        rows.append(("-", "以下为辅助验证脚本指标"))
     if result.read_latencies:
         read_stats = percentile_stats(result.read_latencies)
         rows.extend(
@@ -508,6 +583,7 @@ def print_result_table(
     print("- 如果 read_* 较高，且 wall_elapsed 对 concurrency 变化不敏感，多半是本地磁盘或 HDF5 串行读取成为瓶颈。")
     print("- 如果 prep_* 较高，尤其是多向量写入，说明 Python 构造 token 对象和 float32 转换可能受 CPU 或 GIL 限制。")
     print("- 如果 rpc_* 较高，并且 concurrency 增加后 rpc_TP* 上升但吞吐不涨，说明 Milvus、网络、Proxy 或 DataNode 可能已经打满。")
+    print("- wall_elapsed(s) 表示并发执行阶段的墙钟耗时，包含 HDF5 读取、records 构造、Milvus 请求、线程等待和进度条更新；不包含数据生成、建库建表、建索引、load_collection 和最终 flush。")
 
 
 def timed_call(fn: Callable[[], Any]) -> tuple[Any, float]:

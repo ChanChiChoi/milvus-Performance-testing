@@ -12,9 +12,9 @@ Milvus 压测脚本，使用 `uv` 管理依赖。
 
 ## 脚本清单
 
-- `scripts/insert_single_vector.py`：生成单向量 HDF5 分片，重建并写入 `test_vector` collection。
-- `scripts/insert_multi_vector.py`：生成多向量 HDF5 分片，重建并写入 `test_multi_vector` collection。
-- `scripts/query_benchmark.py`：生成查询样本，执行单向量、多向量或组合查询压测。
+- `scripts/insert_single_vector.py`：生成单向量 HDF5 分片，重建并写入 `test_vector` collection，支持 `--executor-kind thread|process` 和 `--prefetch-batches`。
+- `scripts/insert_multi_vector.py`：生成多向量 HDF5 分片，重建并写入 `test_multi_vector` collection，支持 `--executor-kind thread|process` 和 `--prefetch-batches`。
+- `scripts/query_benchmark.py`：生成查询样本，执行单向量、多向量或组合查询压测，支持 `--executor-kind thread|process` 和 `--prefetch-batches`。
 - `scripts/collection_memory.py`：查看 collection 加载状态、segment 行数，并可结合 QueryNode `/metrics` 过滤 collection 相关 size 指标。
 
 ## 环境准备
@@ -68,7 +68,7 @@ export MILVUS_URI="http://localhost:19530"
 
 ## 输出指标
 
-写入和查询压测脚本都会在最后输出两类信息：本轮运行参数和结果摘要。建议每轮压测都保留完整输出，运维可以据此对照机器 CPU、内存、磁盘 IO、网络和 Milvus 组件指标。
+写入和查询压测脚本都会在最后输出两类信息：本轮运行参数和结果摘要。建议每轮压测都保留完整输出，运维可以据此对照机器 CPU、内存、磁盘 IO、网络和 Milvus 组件指标。结果表里会先输出业务指标，再用分隔线标出“以下为辅助验证脚本指标”，方便区分主结果和阶段耗时。
 
 ### 统计口径
 
@@ -76,6 +76,7 @@ export MILVUS_URI="http://localhost:19530"
 - 写入脚本里的 `operation` 是一次 `client.insert()` 调用，通常等于一个 batch。
 - 查询脚本里的 `operation` 是一个查询样本；当 `--target both` 时，一个 operation 内会依次执行单向量查询和多向量查询。
 - `TP50(s)` / `TP90(s)` / `TP99(s)` 只统计成功 operation 的耗时。
+- `read_TP*` / `prep_TP*` / `rpc_TP*` 是辅助验证指标，分别对应 HDF5 读取、Python 对象构造和 Milvus RPC。
 - 写入脚本的 TP 是 batch 延迟，不是单条样本延迟；查询脚本的 TP 是单条查询样本延迟。
 - `operations/sec` 在写入脚本中是 batch QPS，在查询脚本中基本等同于查询 QPS。
 - `success_rows/sec` 更适合看样本吞吐；写入脚本表示成功写入样本数每秒，查询脚本表示成功查询样本数每秒。
@@ -152,10 +153,11 @@ export MILVUS_URI="http://localhost:19530"
 - `operations`：实际提交到线程池执行的操作数。
 - `successful_operations`：完全成功的 operation 数。
 - `failed_operations`：失败或部分失败的 operation 数。
-- `wall_elapsed(s)`：并发执行阶段墙钟耗时。
+- `wall_elapsed(s)`：并发执行阶段墙钟耗时，包含 HDF5 读取、records 构造、Milvus 请求、线程/进程等待和进度条更新；不包含数据生成、建库建表、建索引、`load_collection` 和最终 `flush`。
 - `success_rows/sec`：成功样本吞吐，建议作为主要吞吐指标。
 - `total_rows/sec`：成功和失败样本合计吞吐，用于观察失败较多时客户端实际推进速度。
 - `operations/sec`：操作级 QPS；写入是 batch QPS，查询是查询 QPS。
+- `read_latency_samples` / `prep_latency_samples` / `rpc_latency_samples`：辅助验证指标的样本数。
 - `latency_samples`：参与 TP 统计的成功 operation 数。
 - `TP50(s)`：成功 operation 的 50 分位耗时。
 - `TP90(s)`：成功 operation 的 90 分位耗时。
@@ -247,6 +249,8 @@ uv run python scripts/insert_multi_vector.py \
   --token-count 300 \
   --insert-batch-size 8 \
   --concurrency 2 \
+  --prefetch-batches 4 \
+  --executor-kind process \
   --multi-vector-mode struct-float32 \
   --metric-type MAX_SIM_COSINE \
   --flat-metric-type COSINE \
@@ -260,7 +264,7 @@ uv run python scripts/insert_multi_vector.py \
 
 ### 3. 查询压测
 
-该命令会生成 `data/query_samples` 下 4 个 HDF5 查询分片，加载 `test_vector` 和 `test_multi_vector`，然后对 100 万条查询样本做 topK=4000 查询。
+该命令会生成 `data/query_samples` 下 4 个 HDF5 查询分片，加载 `test_vector` 和 `test_multi_vector`，然后对 100 万条查询样本做 topK=4000 查询。查询脚本同样支持 `--executor-kind process` 和 `--prefetch-batches`，适合把客户端预处理和服务端 RPC 分开观察。
 
 ```bash
 uv run python scripts/query_benchmark.py \
@@ -281,6 +285,8 @@ uv run python scripts/query_benchmark.py \
   --data-id-max 1000000 \
   --query-read-batch-size 512 \
   --concurrency 8 \
+  --prefetch-batches 16 \
+  --executor-kind process \
   --limit 4000 \
   --single-metric-type COSINE \
   --multi-metric-type MAX_SIM_COSINE \
@@ -299,6 +305,10 @@ uv run python scripts/query_benchmark.py \
 - `target=both`：6 条查询全部成功，`success_rate=100.00%`，`wall_elapsed=56.33s`，`TP50=18.503s`，`TP90=20.885s`，`TP99=22.287s`。
 
 结论：维度拆分链路正常，没有发现单向量 1024 维和多向量 128 维的 shape/EmbeddingList 维度错配；当前主要瓶颈是多向量在 `limit=4000`、`search_ef=4000`、`query_token_count=30` 下查询非常重，并可能触发 60 秒 RPC timeout。正式压测多向量时建议先降低 `limit/search_ef` 做容量曲线，或提高 `--timeout` 到 120/180 秒后再观察 timeout 情况。
+
+## FAQ
+
+如果你在对 `concurrency`、`insert_batch_size`、`prefetch_batches` 或 `executor_kind` 做对比，建议先看根目录的 [faq.md](faq.md)。里面把“单窗口不变、双窗口变快、`wall_elapsed` 变化不大”等现象整理成了可直接复用的问答。
 
 ### 4. Collection 内存查看
 
@@ -421,6 +431,8 @@ uv run python scripts/insert_multi_vector.py \
   --token-count 300 \
   --insert-batch-size 8 \
   --concurrency 2 \
+  --prefetch-batches 4 \
+  --executor-kind process \
   --multi-vector-mode struct-float32
 
 uv run python scripts/query_benchmark.py \
@@ -441,6 +453,8 @@ uv run python scripts/query_benchmark.py \
   --data-id-max 1000000 \
   --query-read-batch-size 512 \
   --concurrency 8 \
+  --prefetch-batches 16 \
+  --executor-kind process \
   --limit 4000 \
   --search-ef 4000
 ```
