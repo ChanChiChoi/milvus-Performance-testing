@@ -23,6 +23,7 @@ from milvus_bench_common import (
     expected_shard_paths,
     get_thread_client,
     h5_rows,
+    iter_h5_slice_specs,
     make_client,
     remove_tmp_and_replace,
     run_concurrent_operations,
@@ -142,6 +143,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generate-only", action="store_true")
     parser.add_argument("--single-collection", default=DEFAULT_SINGLE_COLLECTION)
     parser.add_argument("--multi-collection", default=DEFAULT_MULTI_COLLECTION)
+    parser.add_argument("--replica-number", type=int, default=2, help="Replica count used when loading collection")
     parser.add_argument("--target", choices=["single", "multi", "both"], default="both")
     parser.add_argument("--multi-vector-mode", choices=[MODE_STRUCT_FLOAT32, MODE_FLAT_FP16], default=MODE_STRUCT_FLOAT32)
     parser.add_argument("--vector-dim", type=int, default=1024)
@@ -295,9 +297,17 @@ def load_collections(args: argparse.Namespace) -> None:
     client = make_client(config)
     try:
         if args.target in ("single", "both"):
-            client.load_collection(args.single_collection, timeout=args.timeout)
+            client.load_collection(
+                args.single_collection,
+                replica_number=args.replica_number,
+                timeout=args.timeout,
+            )
         if args.target in ("multi", "both"):
-            client.load_collection(args.multi_collection, timeout=args.timeout)
+            client.load_collection(
+                args.multi_collection,
+                replica_number=args.replica_number,
+                timeout=args.timeout,
+            )
     finally:
         client.close()
 
@@ -418,6 +428,7 @@ def run_queries(args: argparse.Namespace) -> None:
             "target": args.target,
             "single_collection": args.single_collection,
             "multi_collection": args.multi_collection,
+            "replica_number": args.replica_number,
             "data_dir": args.data_dir,
             "total_queries": total_rows,
             "shard_rows": args.shard_rows,
@@ -450,6 +461,8 @@ def validate_args(args: argparse.Namespace) -> None:
         errors.append(f"--query-token-count must be positive, got {args.query_token_count}")
     if args.concurrency <= 0:
         errors.append(f"--concurrency must be positive, got {args.concurrency}")
+    if args.replica_number <= 0:
+        errors.append(f"--replica-number must be positive, got {args.replica_number}")
     if args.prefetch_batches < 0:
         errors.append(f"--prefetch-batches must be >= 0, got {args.prefetch_batches}")
     if args.limit <= 0:

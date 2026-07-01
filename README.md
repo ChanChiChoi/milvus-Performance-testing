@@ -16,7 +16,7 @@ Milvus 压测脚本，使用 `uv` 管理依赖。
 - `scripts/insert_multi_vector.py`：生成多向量 HDF5 分片，重建并写入 `test_multi_vector` collection，支持 `--executor-kind thread|process` 和 `--prefetch-batches`，默认使用 `process`。
 - `scripts/update_single_vector.py`：基于单向量 ready 分片生成 ready/random 混合 update 分片，对已有 `test_vector` 执行 `query -> delete(if found) -> insert`，默认使用 `process`。
 - `scripts/update_multi_vector.py`：基于多向量 ready 分片生成 ready/random 混合 update 分片，对已有 `test_multi_vector` 执行 `query -> delete(if found) -> insert`，默认使用 `process`。
-- `scripts/query_benchmark.py`：生成查询样本，执行单向量、多向量或组合查询压测，支持 `--executor-kind thread|process` 和 `--prefetch-batches`，默认使用 `process`。
+- `scripts/query_benchmark.py`：生成查询样本，执行单向量、多向量或组合查询压测，支持 `--executor-kind thread|process`、`--prefetch-batches` 和 `--replica-number`，默认使用 `process`。
 - `scripts/collection_memory.py`：查看 collection 加载状态、segment 行数，并可结合 QueryNode `/metrics` 过滤 collection 相关 size 指标。
 
 ## 环境准备
@@ -55,7 +55,7 @@ export MILVUS_URI="http://localhost:19530"
 
 - 写入脚本默认会 drop 已存在的目标 collection 后重建；如果只是检查现有 collection，不要直接运行写入命令，或加 `--no-drop` 让脚本在 collection 已存在时报错退出。
 - update 脚本不会重建 collection，要求先用对应 insert 脚本写入 ready 数据；`--ready-data-dir` 必须指向 insert 生成的 HDF5 分片目录；如果 ready 行数不足以按 `--random-ratio` 生成目标 update 分片，脚本会在生成前报错，提示先重新运行 insert 脚本生成足够数据。
-- 写入脚本支持 `--num-shards` 和 `--replica-number`：前者传给 Milvus `create_collection(num_shards=...)`，只在新建 collection 时生效；后者传给 `load_collection(replica_number=...)`，需要集群有足够 QueryNode 或 resource group 容量。
+- 写入脚本支持 `--num-shards`，传给 Milvus `create_collection(num_shards=...)`，只在新建 collection 时生效；写入脚本和查询脚本都支持 `--replica-number`，会在脚本主动 `load_collection(replica_number=...)` 时生效，需要集群有足够 QueryNode 或 resource group 容量。
 - 写入脚本支持 `--delete-ratio` 模拟 update 压力：默认 `0`，不执行额外操作；取值 `1-100` 时，每 100 条插入数据中选最后 N 条执行 `query -> delete -> insert`，其中 query/delete 使用 `uuid1` 和 `uuid2` 等值 filter，最后再把同一条记录原样插回去。
 - 参数必须保持一致：单向量写入的 `--vector-dim` 要等于查询脚本的 `--vector-dim`；多向量写入的 `--vector-dim` 要等于查询脚本的 `--multi-vector-dim`。
 - 多向量写入的 `--token-count` 是 collection 每条样本最大 token vector 数量，查询脚本的 `--query-token-count` 是每条查询使用的 token vector 数量；当前默认写入 300、查询 30。
@@ -96,7 +96,7 @@ export MILVUS_URI="http://localhost:19530"
 - `db_name`：Milvus database 名称。
 - `collection`：写入脚本当前重建并写入的 collection。
 - `num_shards`：Milvus collection 写入分片数，写入脚本默认 `8`；这是远端 collection 的 shard 数，不是本地 HDF5 分片行数。
-- `replica_number`：写入脚本建表、建索引后加载 collection 使用的副本数，默认 `2`。
+- `replica_number`：脚本主动加载 collection 时使用的副本数，写入和查询脚本默认 `2`。
 - `single_collection` / `multi_collection`：查询脚本使用的单向量和多向量 collection。
 - `target`：查询目标，取值为 `single`、`multi` 或 `both`。
 - `data_dir`：本轮读取或生成 HDF5 分片的目录。
@@ -129,7 +129,7 @@ export MILVUS_URI="http://localhost:19530"
 - `--create-db`：当 `--db-name` 不存在时自动创建 database；不加时 database 不存在会报错退出。
 - `--collection-name`：写入脚本重建并写入的 collection 名称；查询脚本使用 `--single-collection` 和 `--multi-collection` 指定查询目标。
 - `--num-shards`：仅写入脚本支持，创建 Milvus collection 时传入的 shard 数，默认 `8`；修改该值需要重建 collection。
-- `--replica-number`：仅写入脚本支持，建表并建索引后 `load_collection()` 使用的副本数，默认 `2`；副本数过大时 load 可能因 QueryNode 资源不足失败。
+- `--replica-number`：写入和查询脚本均支持，传给 `load_collection()` 的副本数，默认 `2`；副本数过大时 load 可能因 QueryNode 资源不足失败。查询脚本加 `--no-load` 时不会重新 load，也不会应用该参数。
 - `--generation-batch-size`：生成 HDF5 数据时每批写入内存数组的行数；单向量和查询单向量数据也用它作为 HDF5 chunk 行数，多向量写入的 `vector` chunk 由 `--vector-chunk-rows` 单独控制。
 - `--force-regenerate`：忽略已有完整分片，重新生成 HDF5 数据。
 - `--skip-generate`：跳过数据生成，直接读取现有 HDF5 分片执行建表、写入或查询。
@@ -140,7 +140,7 @@ export MILVUS_URI="http://localhost:19530"
 - `--ready-data-dir`：仅 update 脚本支持，指定对应 insert 脚本之前生成的 ready 分片目录；ready 行数不足时会直接报错。
 - `--random-ratio`：仅 update 脚本支持，范围 `1-100`；每 100 行窗口内按该比例生成随机新数据，其余从 `--ready-data-dir` 读取，并在窗口内打散。
 - `--no-drop`：仅写入脚本支持；collection 已存在时不删除重建，而是报错退出。
-- `--no-load`：仅查询脚本支持；查询前不调用 `load_collection`，适合 collection 已经由外部加载的场景。
+- `--no-load`：仅查询脚本支持；查询前不调用 `load_collection`，适合 collection 已经由外部按目标副本数加载的场景。
 - `--hnsw-m` / `--hnsw-ef-construction`：建 HNSW 索引时的 `M` 和 `efConstruction` 参数。
 - `--metric-type`：写入脚本建索引用的 metric；单向量默认 `COSINE`，多向量 `struct-float32` 默认 `MAX_SIM_COSINE`。
 - `--single-metric-type` / `--multi-metric-type` / `--flat-metric-type`：查询脚本搜索参数 metric；分别用于单向量、`struct-float32` 多向量和 `flat-fp16` 多向量。
@@ -332,7 +332,7 @@ uv run python scripts/update_multi_vector.py \
 
 ### 5. 查询压测
 
-该命令会生成 `data/query_samples` 下 4 个 HDF5 查询分片，加载 `test_vector` 和 `test_multi_vector`，然后对 100 万条查询样本做 topK=4000 查询。查询脚本默认使用 `--executor-kind process`，并支持 `--prefetch-batches`，适合把客户端预处理和服务端 RPC 分开观察。
+该命令会生成 `data/query_samples` 下 4 个 HDF5 查询分片，按 `--replica-number` 加载 `test_vector` 和 `test_multi_vector`，然后对 100 万条查询样本做 topK=4000 查询。查询脚本默认使用 `--executor-kind process`，并支持 `--prefetch-batches`，适合把客户端预处理和服务端 RPC 分开观察。若 collection 已由外部按目标副本数加载，可加 `--no-load` 避免脚本重新加载。
 
 ```bash
 uv run python scripts/query_benchmark.py \
@@ -345,6 +345,7 @@ uv run python scripts/query_benchmark.py \
   --generation-batch-size 512 \
   --single-collection test_vector \
   --multi-collection test_multi_vector \
+  --replica-number 2 \
   --target both \
   --multi-vector-mode struct-float32 \
   --vector-dim 1024 \
@@ -537,6 +538,7 @@ uv run python scripts/query_benchmark.py \
   --data-dir data/query_samples \
   --single-collection test_vector \
   --multi-collection test_multi_vector \
+  --replica-number 2 \
   --target both \
   --multi-vector-mode struct-float32 \
   --vector-dim 1024 \
@@ -600,6 +602,7 @@ uv run python scripts/query_benchmark.py \
   --data-dir /tmp/my_script_query_func \
   --single-collection tmp_codex_script_single \
   --multi-collection tmp_codex_script_multi \
+  --replica-number 2 \
   --db-name default \
   --target both \
   --concurrency 1 \

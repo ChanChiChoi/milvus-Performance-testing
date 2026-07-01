@@ -293,6 +293,7 @@ def update_records(args: argparse.Namespace) -> None:
             'uri': config.uri,
             'db_name': config.db_name,
             'collection': args.collection_name,
+            'replica_number': args.replica_number,
             'ready_data_dir': args.ready_data_dir,
             'data_dir': args.data_dir,
             'total_rows': total_rows,
