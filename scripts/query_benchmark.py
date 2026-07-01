@@ -150,7 +150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-id-max", type=int, default=1_000_000)
     parser.add_argument("--query-read-batch-size", type=int, default=512)
     parser.add_argument("--prefetch-batches", type=int, default=0, help="Read this many query batches ahead; 0 uses concurrency * 2")
-    parser.add_argument("--executor-kind", choices=["thread", "process"], default="thread", help="Use threads or processes for the worker pool")
+    parser.add_argument("--executor-kind", choices=["thread", "process"], default="process", help="Use threads or processes for the worker pool")
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--limit", type=int, default=4000)
     parser.add_argument("--single-metric-type", default="COSINE")

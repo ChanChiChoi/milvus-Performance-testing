@@ -12,9 +12,11 @@ Milvus 压测脚本，使用 `uv` 管理依赖。
 
 ## 脚本清单
 
-- `scripts/insert_single_vector.py`：生成单向量 HDF5 分片，重建并写入 `test_vector` collection，支持 `--executor-kind thread|process` 和 `--prefetch-batches`。
-- `scripts/insert_multi_vector.py`：生成多向量 HDF5 分片，重建并写入 `test_multi_vector` collection，支持 `--executor-kind thread|process` 和 `--prefetch-batches`。
-- `scripts/query_benchmark.py`：生成查询样本，执行单向量、多向量或组合查询压测，支持 `--executor-kind thread|process` 和 `--prefetch-batches`。
+- `scripts/insert_single_vector.py`：生成单向量 HDF5 分片，重建并写入 `test_vector` collection，支持 `--executor-kind thread|process` 和 `--prefetch-batches`，默认使用 `process`。
+- `scripts/insert_multi_vector.py`：生成多向量 HDF5 分片，重建并写入 `test_multi_vector` collection，支持 `--executor-kind thread|process` 和 `--prefetch-batches`，默认使用 `process`。
+- `scripts/update_single_vector.py`：基于单向量 ready 分片生成 ready/random 混合 update 分片，对已有 `test_vector` 执行 `query -> delete(if found) -> insert`，默认使用 `process`。
+- `scripts/update_multi_vector.py`：基于多向量 ready 分片生成 ready/random 混合 update 分片，对已有 `test_multi_vector` 执行 `query -> delete(if found) -> insert`，默认使用 `process`。
+- `scripts/query_benchmark.py`：生成查询样本，执行单向量、多向量或组合查询压测，支持 `--executor-kind thread|process` 和 `--prefetch-batches`，默认使用 `process`。
 - `scripts/collection_memory.py`：查看 collection 加载状态、segment 行数，并可结合 QueryNode `/metrics` 过滤 collection 相关 size 指标。
 
 ## 环境准备
@@ -37,10 +39,12 @@ export MILVUS_URI="http://localhost:19530"
 
 ## 数据分片
 
-三个会生成 HDF5 的脚本分别使用独立目录：
+会生成 HDF5 的脚本分别使用独立目录：
 
 - `data/test_vector`
 - `data/test_multi_vector`
+- `data/update_test_vector`
+- `data/update_test_multi_vector`
 - `data/query_samples`
 
 默认每个目录生成 4 个 `.h5` 分片，每个分片 25 万条，总计 100 万条。脚本重跑时会按分片数量、行数、关键维度参数和公共标量数据版本判断是否跳过生成。
@@ -50,8 +54,9 @@ export MILVUS_URI="http://localhost:19530"
 ## 执行前注意事项
 
 - 写入脚本默认会 drop 已存在的目标 collection 后重建；如果只是检查现有 collection，不要直接运行写入命令，或加 `--no-drop` 让脚本在 collection 已存在时报错退出。
+- update 脚本不会重建 collection，要求先用对应 insert 脚本写入 ready 数据；`--ready-data-dir` 必须指向 insert 生成的 HDF5 分片目录；如果 ready 行数不足以按 `--random-ratio` 生成目标 update 分片，脚本会在生成前报错，提示先重新运行 insert 脚本生成足够数据。
 - 写入脚本支持 `--num-shards` 和 `--replica-number`：前者传给 Milvus `create_collection(num_shards=...)`，只在新建 collection 时生效；后者传给 `load_collection(replica_number=...)`，需要集群有足够 QueryNode 或 resource group 容量。
-- 写入脚本支持 `--delete-ratio` 模拟 update 压力：默认 `0`，不执行额外操作；取值 `1-100` 时，每 100 条插入数据中选最后 N 条执行 `query -> delete -> insert`，其中 query/delete 使用 `uuid1` 和 `text` 等值 filter，最后再把同一条记录原样插回去。
+- 写入脚本支持 `--delete-ratio` 模拟 update 压力：默认 `0`，不执行额外操作；取值 `1-100` 时，每 100 条插入数据中选最后 N 条执行 `query -> delete -> insert`，其中 query/delete 使用 `uuid1` 和 `uuid2` 等值 filter，最后再把同一条记录原样插回去。
 - 参数必须保持一致：单向量写入的 `--vector-dim` 要等于查询脚本的 `--vector-dim`；多向量写入的 `--vector-dim` 要等于查询脚本的 `--multi-vector-dim`。
 - 多向量写入的 `--token-count` 是 collection 每条样本最大 token vector 数量，查询脚本的 `--query-token-count` 是每条查询使用的 token vector 数量；当前默认写入 300、查询 30。
 - 修改维度、token 数、`data_id_max` 或数据规模后，旧 HDF5 分片可能不再匹配；建议加 `--force-regenerate` 重新生成。查询脚本会在读取分片前校验 attrs 和 dataset shape。
@@ -75,8 +80,10 @@ export MILVUS_URI="http://localhost:19530"
 - `wall_elapsed(s)` 只统计并发执行阶段，不包含数据生成、建表、load collection 和 flush 时间。
 - 写入脚本里的 `operation` 是一次 `client.insert()` 调用，通常等于一个 batch。
 - 查询脚本里的 `operation` 是一个查询样本；当 `--target both` 时，一个 operation 内会依次执行单向量查询和多向量查询。
+- update 脚本里的 `operation` 是一个 update batch；batch 内会批量 query 一次、命中时批量 delete 一次，然后批量 insert 一次。
 - `TP50(s)` / `TP90(s)` / `TP99(s)` 只统计成功 operation 的耗时。
 - `read_TP*` / `prep_TP*` / `rpc_TP*` 是辅助验证指标，分别对应 HDF5 读取、Python 对象构造和 Milvus RPC。
+- update 脚本会额外输出 `query_TP*` / `delete_TP*` / `insert_TP*`，分别对应 update 阶段的查询、删除和插入耗时；`rpc_TP*` 表示每个 update batch 内 query + delete + insert 的总 RPC 耗时。
 - 写入脚本的 TP 是 batch 延迟，不是单条样本延迟；查询脚本的 TP 是单条查询样本延迟。
 - `operations/sec` 在写入脚本中是 batch QPS，在查询脚本中基本等同于查询 QPS。
 - `success_rows/sec` 更适合看样本吞吐；写入脚本表示成功写入样本数每秒，查询脚本表示成功查询样本数每秒。
@@ -103,8 +110,10 @@ export MILVUS_URI="http://localhost:19530"
 - `milvus_mode` / `multi_vector_mode`：多向量在 Milvus 里的写入/查询模式；当前默认 `struct-float32`。
 - `insert_batch_size`：每次 `client.insert()` 提交的样本数。
 - `delete_ratio`：写入脚本的 update 模拟比例，默认 `0` 表示关闭；例如 `1` 表示每 100 条插入后对最后 1 条执行 `query -> delete -> insert`。
+- `ready_data_dir`：update 脚本读取既有 ready 数据的目录，通常指向对应 insert 脚本生成的 `data/test_vector` 或 `data/test_multi_vector`。
+- `random_ratio`：update 脚本每 100 行窗口内随机新数据比例，范围 `1-100`；例如 `10` 表示 90 行 ready + 10 行 random，打散后写入 `data_dir`。
 - `query_read_batch_size`：查询脚本每次从 HDF5 分片读入内存的样本数。
-- `concurrency`：线程池并发数。
+- `concurrency`：worker 池并发数；`executor_kind` 默认为 `process`，也可显式改为 `thread`。
 - `index_type`：向量索引类型，默认 `HNSW`。
 - `metric_type`：当前向量检索 metric；多向量默认 `MAX_SIM_COSINE`。
 - `limit`：查询 topK，正式压测默认 4000。
@@ -126,7 +135,10 @@ export MILVUS_URI="http://localhost:19530"
 - `--skip-generate`：跳过数据生成，直接读取现有 HDF5 分片执行建表、写入或查询。
 - `--generate-only`：只生成 HDF5 分片，生成完成后退出。
 - `--seed`：随机数据生成种子，默认 `20260610`。
-- `--delete-ratio`：仅写入脚本支持，范围 `0-100`，默认 `0`。为 `0` 时只执行原始插入；大于 0 时每 100 条中选最后 N 条模拟 update，流程为先按 `uuid1` 和 `text` 等值查询，再删除旧记录，最后将同一条记录插回去。
+- `--delete-ratio`：仅写入脚本支持，范围 `0-100`，默认 `0`。为 `0` 时只执行原始插入；大于 0 时每 100 条中选最后 N 条模拟 update，流程为先按 `uuid1` 和 `uuid2` 等值查询，再删除旧记录，最后将同一条记录插回去。
+- `--executor-kind`：写入、查询和 update 脚本均支持 `thread|process`，默认 `process`。
+- `--ready-data-dir`：仅 update 脚本支持，指定对应 insert 脚本之前生成的 ready 分片目录；ready 行数不足时会直接报错。
+- `--random-ratio`：仅 update 脚本支持，范围 `1-100`；每 100 行窗口内按该比例生成随机新数据，其余从 `--ready-data-dir` 读取，并在窗口内打散。
 - `--no-drop`：仅写入脚本支持；collection 已存在时不删除重建，而是报错退出。
 - `--no-load`：仅查询脚本支持；查询前不调用 `load_collection`，适合 collection 已经由外部加载的场景。
 - `--hnsw-m` / `--hnsw-ef-construction`：建 HNSW 索引时的 `M` 和 `efConstruction` 参数。
@@ -150,7 +162,10 @@ export MILVUS_URI="http://localhost:19530"
 - `success_rows`：成功写入或查询的样本数。
 - `failed_rows`：失败的样本数。
 - `success_rate`：样本级成功率，等于 `success_rows / (success_rows + failed_rows)`。
-- `operations`：实际提交到线程池执行的操作数。
+- `operations`：实际提交到 worker 池执行的 operation 数；写入通常是 batch 数，查询通常是查询样本数。
+- `batch_operations`：仅 update 脚本输出，表示实际提交到 worker 池执行的 update batch 数。
+- `query_operations` / `delete_operations` / `insert_operations`：仅 update 脚本输出，分别表示实际执行的 query、delete、insert RPC 次数；batch 模式下每个成功 batch 通常各 1 次 query 和 insert，命中旧数据时 1 次 delete。
+- `deleted_rows`：仅 update 脚本输出，表示 query 命中并被 delete 删除的旧记录数。
 - `successful_operations`：完全成功的 operation 数。
 - `failed_operations`：失败或部分失败的 operation 数。
 - `wall_elapsed(s)`：并发执行阶段墙钟耗时，包含 HDF5 读取、records 构造、Milvus 请求、线程/进程等待和进度条更新；不包含数据生成、建库建表、建索引、`load_collection` 和最终 `flush`。
@@ -219,6 +234,7 @@ uv run python scripts/insert_single_vector.py \
   --vector-dim 1024 \
   --insert-batch-size 1000 \
   --concurrency 4 \
+  --executor-kind process \
   --metric-type COSINE \
   --index-type HNSW \
   --hnsw-m 16 \
@@ -262,9 +278,61 @@ uv run python scripts/insert_multi_vector.py \
   --delete-ratio 0
 ```
 
-### 3. 查询压测
+### 3. 单向量 update
 
-该命令会生成 `data/query_samples` 下 4 个 HDF5 查询分片，加载 `test_vector` 和 `test_multi_vector`，然后对 100 万条查询样本做 topK=4000 查询。查询脚本同样支持 `--executor-kind process` 和 `--prefetch-batches`，适合把客户端预处理和服务端 RPC 分开观察。
+该命令会基于 `data/test_vector` 生成 `data/update_test_vector` 分片。`--random-ratio 10` 表示每 100 行中读取 90 行 ready 数据、生成 10 行 random 数据，打散后执行 update。脚本要求 `test_vector` 已经存在，不会 drop 或重建 collection。
+
+```bash
+uv run python scripts/update_single_vector.py \
+  --uri "$MILVUS_URI" \
+  --db-name llmbp \
+  --timeout 60 \
+  --total-rows 1000000 \
+  --shard-rows 250000 \
+  --ready-data-dir data/test_vector \
+  --data-dir data/update_test_vector \
+  --generation-batch-size 2048 \
+  --collection-name test_vector \
+  --replica-number 2 \
+  --vector-dim 1024 \
+  --insert-batch-size 1000 \
+  --concurrency 4 \
+  --executor-kind process \
+  --random-ratio 10 \
+  --seed 20260610
+```
+
+### 4. 多向量 update
+
+该命令会基于 `data/test_multi_vector` 生成 `data/update_test_multi_vector` 分片，并对已有 `test_multi_vector` 执行 update。
+
+```bash
+uv run python scripts/update_multi_vector.py \
+  --uri "$MILVUS_URI" \
+  --db-name llmbp \
+  --timeout 60 \
+  --total-rows 1000000 \
+  --shard-rows 250000 \
+  --ready-data-dir data/test_multi_vector \
+  --data-dir data/update_test_multi_vector \
+  --generation-batch-size 2048 \
+  --vector-chunk-rows 4 \
+  --collection-name test_multi_vector \
+  --replica-number 2 \
+  --vector-dim 128 \
+  --token-count 300 \
+  --insert-batch-size 8 \
+  --concurrency 2 \
+  --prefetch-batches 4 \
+  --executor-kind process \
+  --multi-vector-mode struct-float32 \
+  --random-ratio 10 \
+  --seed 20260610
+```
+
+### 5. 查询压测
+
+该命令会生成 `data/query_samples` 下 4 个 HDF5 查询分片，加载 `test_vector` 和 `test_multi_vector`，然后对 100 万条查询样本做 topK=4000 查询。查询脚本默认使用 `--executor-kind process`，并支持 `--prefetch-batches`，适合把客户端预处理和服务端 RPC 分开观察。
 
 ```bash
 uv run python scripts/query_benchmark.py \
@@ -310,7 +378,7 @@ uv run python scripts/query_benchmark.py \
 
 如果你在对 `concurrency`、`insert_batch_size`、`prefetch_batches` 或 `executor_kind` 做对比，建议先看根目录的 [faq.md](faq.md)。里面把“单窗口不变、双窗口变快、`wall_elapsed` 变化不大”等现象整理成了可直接复用的问答。
 
-### 4. Collection 内存查看
+### 6. Collection 内存查看
 
 该命令查看 `test_vector` 和 `test_multi_vector` 当前已加载 segment 的内存占用。默认不会主动 load collection，避免无意中把大集合加载进 QueryNode。
 
@@ -396,6 +464,30 @@ uv run python scripts/query_benchmark.py \
   --multi-vector-dim 128 \
   --query-token-count 30 \
   --data-id-max 1000000
+
+uv run python scripts/update_single_vector.py \
+  --generate-only \
+  --uri "$MILVUS_URI" \
+  --db-name llmbp \
+  --total-rows 1000000 \
+  --shard-rows 250000 \
+  --ready-data-dir data/test_vector \
+  --data-dir data/update_test_vector \
+  --vector-dim 1024 \
+  --random-ratio 10
+
+uv run python scripts/update_multi_vector.py \
+  --generate-only \
+  --uri "$MILVUS_URI" \
+  --db-name llmbp \
+  --total-rows 1000000 \
+  --shard-rows 250000 \
+  --ready-data-dir data/test_multi_vector \
+  --data-dir data/update_test_multi_vector \
+  --vector-dim 128 \
+  --token-count 300 \
+  --multi-vector-mode struct-float32 \
+  --random-ratio 10
 ```
 
 ### 已有分片时跳过生成

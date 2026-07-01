@@ -98,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vector-dim", type=int, default=1024)
     parser.add_argument("--insert-batch-size", type=int, default=1000)
     parser.add_argument("--prefetch-batches", type=int, default=0, help="Read this many HDF5 batches ahead; 0 uses concurrency * 2")
-    parser.add_argument("--executor-kind", choices=["thread", "process"], default="thread", help="Use threads or processes for the worker pool")
+    parser.add_argument("--executor-kind", choices=["thread", "process"], default="process", help="Use threads or processes for the worker pool")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--metric-type", default="COSINE")
     parser.add_argument("--index-type", default="HNSW")
