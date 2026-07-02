@@ -24,7 +24,6 @@ from milvus_bench_common import (
     make_text_array,
     make_uuid_array,
     maybe_flush,
-    milvus_string_literal,
     percentile_stats,
     shard_row_count,
 )
@@ -305,14 +304,12 @@ def decode_record_common(batch: dict[str, np.ndarray], idx: int) -> dict[str, ob
 
 
 def record_delete_filter(record: dict[str, object]) -> str:
-    uuid1 = milvus_string_literal(record['uuid1'])
-    uuid2 = milvus_string_literal(record['uuid2'])
-    return f'uuid1 == {uuid1} and uuid2 == {uuid2}'
+    return f'id == {int(record["id"])}'
 
 
 def batch_query_filter(records: list[dict[str, object]]) -> str:
-    uuid_values = ', '.join(milvus_string_literal(record['uuid1']) for record in records)
-    return f'uuid1 in [{uuid_values}]'
+    id_values = ', '.join(str(int(record['id'])) for record in records)
+    return f'id in [{id_values}]'
 
 
 def batch_pk_filter(pk_values: list[int]) -> str:
@@ -329,12 +326,12 @@ def query_delete_insert_records(
     if not records:
         return 0.0, 0.0, 0.0, 0, 0, 0, 0
 
-    expected_keys = {(str(record['uuid1']), str(record['uuid2'])) for record in records}
+    expected_ids = {int(record['id']) for record in records}
     query_start = time.perf_counter()
     rows = client.query(
         collection_name=collection_name,
         filter=batch_query_filter(records),
-        output_fields=['pk', 'uuid1', 'uuid2'],
+        output_fields=['pk', 'id'],
         timeout=timeout,
     )
     query_elapsed = time.perf_counter() - query_start
@@ -343,9 +340,9 @@ def query_delete_insert_records(
     delete_pks: list[int] = []
     seen_pks: set[int] = set()
     for row in rows or []:
-        key = (str(row.get('uuid1')), str(row.get('uuid2')))
+        row_id = row.get('id')
         pk = row.get('pk')
-        if key in expected_keys and pk is not None:
+        if row_id is not None and int(row_id) in expected_ids and pk is not None:
             pk_value = int(pk)
             if pk_value not in seen_pks:
                 seen_pks.add(pk_value)

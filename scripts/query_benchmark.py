@@ -41,7 +41,7 @@ MODE_FLAT_FP16 = "flat-fp16"
 _PROCESS_STATE: dict[str, object] = {}
 
 
-def init_process_worker(config: MilvusConfig, target: str, single_collection: str, multi_collection: str, id_filter: str, limit: int, search_ef: int, timeout: float, single_metric_type: str, multi_metric_type: str, flat_metric_type: str, multi_vector_mode: str, multi_vector_dim: int) -> None:
+def init_process_worker(config: MilvusConfig, target: str, single_collection: str, multi_collection: str, single_id_filter: str, multi_id_filter: str, single_limit: int, multi_limit: int, search_ef: int | None, timeout: float, single_metric_type: str, multi_metric_type: str, flat_metric_type: str, multi_vector_mode: str, multi_vector_dim: int, data_id_max: int) -> None:
     _PROCESS_STATE.clear()
     _PROCESS_STATE.update(
         {
@@ -49,8 +49,10 @@ def init_process_worker(config: MilvusConfig, target: str, single_collection: st
             "target": target,
             "single_collection": single_collection,
             "multi_collection": multi_collection,
-            "id_filter": id_filter,
-            "limit": limit,
+            "single_id_filter": single_id_filter,
+            "multi_id_filter": multi_id_filter,
+            "single_limit": single_limit,
+            "multi_limit": multi_limit,
             "search_ef": search_ef,
             "timeout": timeout,
             "single_metric_type": single_metric_type,
@@ -58,6 +60,7 @@ def init_process_worker(config: MilvusConfig, target: str, single_collection: st
             "flat_metric_type": flat_metric_type,
             "multi_vector_mode": multi_vector_mode,
             "multi_vector_dim": multi_vector_dim,
+            "data_id_max": data_id_max,
         }
     )
 
@@ -75,7 +78,11 @@ def process_query_worker(spec: H5SliceSpec) -> list[OperationResult]:
     for idx in range(spec.rows):
         worker_start = time.perf_counter()
         sample_id = int(ids[idx])
-        expr = filter_expr(sample_id, state["id_filter"])  # type: ignore[arg-type]
+        single_expr = filter_expr(sample_id, state["single_id_filter"])  # type: ignore[arg-type]
+        multi_expr = filter_expr(sample_id, state["multi_id_filter"])  # type: ignore[arg-type]
+        if state["target"] == "multi" and state["multi_id_filter"] == "in":
+            multi_expr = ids_in_filter(simulated_single_ids(sample_id, state["single_limit"], state["data_id_max"]))  # type: ignore[arg-type]
+        multi_limit = state["multi_limit"] if state["target"] in ("multi", "both") else state["single_limit"]
         prep_start = time.perf_counter()
         single_data = [single[idx].copy()] if state["target"] in ("single", "both") else None  # type: ignore[index]
         multi_data = None
@@ -89,26 +96,33 @@ def process_query_worker(spec: H5SliceSpec) -> list[OperationResult]:
         try:
             rpc_start = time.perf_counter()
             if single_data is not None:
-                client.search(
+                single_result = client.search(
                     collection_name=state["single_collection"],  # type: ignore[index]
                     data=single_data,
                     anns_field="vector",
-                    filter=expr,
-                    limit=state["limit"],  # type: ignore[index]
+                    filter=single_expr,
+                    limit=state["single_limit"],  # type: ignore[index]
                     output_fields=["id", "platform"],
-                    search_params={"metric_type": state["single_metric_type"], "params": {"ef": state["search_ef"]}},  # type: ignore[index]
+                    search_params=build_search_params(state["single_metric_type"], state["search_ef"]),  # type: ignore[arg-type]
                     timeout=state["timeout"],  # type: ignore[index]
                 )
+                if state["target"] == "both" and state["multi_id_filter"] == "in":
+                    single_ids = extract_search_ids(single_result)
+                    if not single_ids:
+                        multi_data = None
+                    else:
+                        multi_expr = ids_in_filter(single_ids)
+                    multi_limit = state["multi_limit"]
             if multi_data is not None:
                 if state["multi_vector_mode"] == MODE_STRUCT_FLOAT32:  # type: ignore[index]
                     client.search(
                         collection_name=state["multi_collection"],  # type: ignore[index]
                         data=multi_data,
                         anns_field="tokens[token_vector]",
-                        filter=expr,
-                        limit=state["limit"],  # type: ignore[index]
+                        filter=multi_expr,
+                        limit=multi_limit,  # type: ignore[index]
                         output_fields=["id", "platform"],
-                        search_params={"metric_type": state["multi_metric_type"], "params": {"ef": state["search_ef"]}},  # type: ignore[index]
+                        search_params=build_search_params(state["multi_metric_type"], state["search_ef"]),  # type: ignore[arg-type]
                         timeout=state["timeout"],  # type: ignore[index]
                     )
                 else:
@@ -116,10 +130,10 @@ def process_query_worker(spec: H5SliceSpec) -> list[OperationResult]:
                         collection_name=state["multi_collection"],  # type: ignore[index]
                         data=multi_data,
                         anns_field="vector",
-                        filter=expr,
-                        limit=state["limit"],  # type: ignore[index]
+                        filter=multi_expr,
+                        limit=multi_limit,  # type: ignore[index]
                         output_fields=["id", "platform"],
-                        search_params={"metric_type": state["flat_metric_type"], "params": {"ef": state["search_ef"]}},  # type: ignore[index]
+                        search_params=build_search_params(state["flat_metric_type"], state["search_ef"]),  # type: ignore[arg-type]
                         timeout=state["timeout"],  # type: ignore[index]
                     )
             rpc_elapsed = time.perf_counter() - rpc_start
@@ -154,12 +168,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-batches", type=int, default=0, help="Read this many query batches ahead; 0 uses concurrency * 2")
     parser.add_argument("--executor-kind", choices=["thread", "process"], default="process", help="Use threads or processes for the worker pool")
     parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--limit", type=int, default=4000)
+    parser.add_argument("--single-limit", type=int, default=4000, help="TopK used by the single-vector search")
+    parser.add_argument("--multi-limit", type=int, default=None, help="TopK used by the multi-vector search; defaults to --single-limit")
     parser.add_argument("--single-metric-type", default="COSINE")
     parser.add_argument("--multi-metric-type", default="MAX_SIM_COSINE")
     parser.add_argument("--flat-metric-type", default="COSINE")
-    parser.add_argument("--search-ef", type=int, default=4000)
-    parser.add_argument("--id-filter", choices=["none", "eq", "gte"], default="none")
+    parser.add_argument("--search-ef", default=None, help="Optional HNSW ef search param; omit or pass none to let Milvus use its default")
+    parser.add_argument("--single-id-filter", choices=["none", "eq", "gte"], default="none")
+    parser.add_argument("--multi-id-filter", choices=["none", "eq", "gte", "in"], default="eq")
     parser.add_argument("--seed", type=int, default=20260610)
     parser.add_argument("--no-load", action="store_true", help="Do not call load_collection before searching")
     return parser.parse_args()
@@ -229,6 +245,59 @@ def filter_expr(sample_id: int, mode: str) -> str:
     if mode == "gte":
         return f"id >= {sample_id}"
     return ""
+
+
+def ids_in_filter(ids: list[int]) -> str:
+    return "id in [" + ", ".join(str(value) for value in ids) + "]"
+
+
+def simulated_single_ids(sample_id: int, count: int, data_id_max: int) -> list[int]:
+    if data_id_max <= 0:
+        return []
+    return [((sample_id + offset - 1) % data_id_max) + 1 for offset in range(count)]
+
+
+def parse_optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.lower() == "none":
+        return None
+    return int(value)
+
+
+def build_search_params(metric_type: str, search_ef: int | None) -> dict[str, object]:
+    params: dict[str, object] = {"metric_type": metric_type}
+    if search_ef is not None:
+        params["params"] = {"ef": search_ef}
+    return params
+
+
+def extract_search_ids(search_result: object) -> list[int]:
+    if not search_result:
+        return []
+    hits = search_result[0] if isinstance(search_result, (list, tuple)) else search_result
+    ids: list[int] = []
+    for hit in hits or []:
+        value = None
+        entity = getattr(hit, "entity", None)
+        if entity is not None and hasattr(entity, "get"):
+            value = entity.get("id")
+        if value is None and isinstance(hit, dict):
+            entity_dict = hit.get("entity")
+            if isinstance(entity_dict, dict):
+                value = entity_dict.get("id")
+            else:
+                value = hit.get("id")
+        if value is None and hasattr(hit, "get"):
+            try:
+                value = hit.get("id")
+            except Exception:
+                value = None
+        if value is None:
+            value = getattr(hit, "id", None)
+        if value is not None:
+            ids.append(int(value))
+    return ids
 
 
 def iter_query_samples(paths: list[Path], batch_size: int):
@@ -312,6 +381,10 @@ def load_collections(args: argparse.Namespace) -> None:
         client.close()
 
 
+def effective_multi_limit(args: argparse.Namespace) -> int:
+    return args.multi_limit if args.multi_limit is not None else args.single_limit
+
+
 def run_queries(args: argparse.Namespace) -> None:
     config = config_from_args(args)
     ensure_database(config, args.create_db)
@@ -341,8 +414,10 @@ def run_queries(args: argparse.Namespace) -> None:
                 args.target,
                 args.single_collection,
                 args.multi_collection,
-                args.id_filter,
-                args.limit,
+                args.single_id_filter,
+                args.multi_id_filter,
+                args.single_limit,
+                effective_multi_limit(args),
                 args.search_ef,
                 args.timeout,
                 args.single_metric_type,
@@ -350,6 +425,7 @@ def run_queries(args: argparse.Namespace) -> None:
                 args.flat_metric_type,
                 args.multi_vector_mode,
                 args.multi_vector_dim,
+                args.data_id_max,
             ),
         )
     else:
@@ -357,7 +433,11 @@ def run_queries(args: argparse.Namespace) -> None:
             worker_start = time.perf_counter()
             client = get_thread_client(config)
             sample_id = int(sample["id"])
-            expr = filter_expr(sample_id, args.id_filter)
+            single_expr = filter_expr(sample_id, args.single_id_filter)
+            multi_expr = filter_expr(sample_id, args.multi_id_filter)
+            if args.target == "multi" and args.multi_id_filter == "in":
+                multi_expr = ids_in_filter(simulated_single_ids(sample_id, args.single_limit, args.data_id_max))
+            multi_limit = effective_multi_limit(args) if args.target in ("multi", "both") else args.single_limit
             single_data = [sample["single_vector"]] if args.target in ("single", "both") else None
             multi_data = None
             if args.target in ("multi", "both"):
@@ -370,26 +450,33 @@ def run_queries(args: argparse.Namespace) -> None:
             try:
                 rpc_start = time.perf_counter()
                 if single_data is not None:
-                    client.search(
+                    single_result = client.search(
                         collection_name=args.single_collection,
                         data=single_data,
                         anns_field="vector",
-                        filter=expr,
-                        limit=args.limit,
+                        filter=single_expr,
+                        limit=args.single_limit,
                         output_fields=["id", "platform"],
-                        search_params={"metric_type": args.single_metric_type, "params": {"ef": args.search_ef}},
+                        search_params=build_search_params(args.single_metric_type, args.search_ef),
                         timeout=args.timeout,
                     )
+                    if args.target == "both" and args.multi_id_filter == "in":
+                        single_ids = extract_search_ids(single_result)
+                        if not single_ids:
+                            multi_data = None
+                        else:
+                            multi_expr = ids_in_filter(single_ids)
+                        multi_limit = effective_multi_limit(args)
                 if multi_data is not None:
                     if args.multi_vector_mode == MODE_STRUCT_FLOAT32:
                         client.search(
                             collection_name=args.multi_collection,
                             data=multi_data,
                             anns_field="tokens[token_vector]",
-                            filter=expr,
-                            limit=args.limit,
+                            filter=multi_expr,
+                            limit=multi_limit,
                             output_fields=["id", "platform"],
-                            search_params={"metric_type": args.multi_metric_type, "params": {"ef": args.search_ef}},
+                            search_params=build_search_params(args.multi_metric_type, args.search_ef),
                             timeout=args.timeout,
                         )
                     else:
@@ -397,10 +484,10 @@ def run_queries(args: argparse.Namespace) -> None:
                             collection_name=args.multi_collection,
                             data=multi_data,
                             anns_field="vector",
-                            filter=expr,
-                            limit=args.limit,
+                            filter=multi_expr,
+                            limit=multi_limit,
                             output_fields=["id", "platform"],
-                            search_params={"metric_type": args.flat_metric_type, "params": {"ef": args.search_ef}},
+                            search_params=build_search_params(args.flat_metric_type, args.search_ef),
                             timeout=args.timeout,
                         )
                 rpc_elapsed = time.perf_counter() - rpc_start
@@ -440,9 +527,11 @@ def run_queries(args: argparse.Namespace) -> None:
             "concurrency": args.concurrency,
             "prefetch_batches": prefetch_batches,
             "executor_kind": args.executor_kind,
-            "limit": args.limit,
+            "single_limit": args.single_limit,
+            "multi_limit": effective_multi_limit(args),
             "search_ef": args.search_ef,
-            "id_filter": args.id_filter,
+            "single_id_filter": args.single_id_filter,
+            "multi_id_filter": args.multi_id_filter,
         },
     )
 
@@ -465,10 +554,26 @@ def validate_args(args: argparse.Namespace) -> None:
         errors.append(f"--replica-number must be positive, got {args.replica_number}")
     if args.prefetch_batches < 0:
         errors.append(f"--prefetch-batches must be >= 0, got {args.prefetch_batches}")
-    if args.limit <= 0:
-        errors.append(f"--limit must be positive, got {args.limit}")
-    if not args.generate_only and args.search_ef < args.limit:
-        errors.append(f"--search-ef({args.search_ef}) must be >= --limit({args.limit})")
+    if args.single_limit <= 0:
+        errors.append(f"--single-limit must be positive, got {args.single_limit}")
+    if args.multi_limit is not None and args.multi_limit <= 0:
+        errors.append(f"--multi-limit must be positive, got {args.multi_limit}")
+    try:
+        args.search_ef = parse_optional_int(args.search_ef)
+    except ValueError:
+        errors.append(f"--search-ef must be a positive integer or none, got {args.search_ef!r}")
+    if args.search_ef is not None and args.search_ef <= 0:
+        errors.append(f"--search-ef must be positive or none, got {args.search_ef}")
+    if args.multi_id_filter == "in" and args.target not in ("multi", "both"):
+        errors.append("--multi-id-filter in is only valid with --target multi or --target both")
+    if args.target == "single":
+        max_search_limit = args.single_limit
+    elif args.target == "multi":
+        max_search_limit = effective_multi_limit(args)
+    else:
+        max_search_limit = max(args.single_limit, effective_multi_limit(args))
+    if args.search_ef is not None and not args.generate_only and args.search_ef < max_search_limit:
+        errors.append(f"--search-ef({args.search_ef}) must be >= max search limit({max_search_limit})")
     if args.data_id_max <= 0:
         errors.append(f"--data-id-max must be positive, got {args.data_id_max}")
     if args.query_read_batch_size <= 0:

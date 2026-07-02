@@ -173,13 +173,8 @@ def create_collection(args: argparse.Namespace) -> None:
 
         index_params = client.prepare_index_params()
         index_params.add_index(
-            field_name="uuid1",
-            index_name="uuid1_inverted_idx",
-            index_type="INVERTED",
-        )
-        index_params.add_index(
-            field_name="uuid2",
-            index_name="uuid2_inverted_idx",
+            field_name="id",
+            index_name="id_inverted_idx",
             index_type="INVERTED",
         )
         index_params.add_index(

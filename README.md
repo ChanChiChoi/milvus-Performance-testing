@@ -49,25 +49,25 @@ export MILVUS_URI="http://localhost:19530"
 
 默认每个目录生成 4 个 `.h5` 分片，每个分片 25 万条，总计 100 万条。脚本重跑时会按分片数量、行数、关键维度参数和公共标量数据版本判断是否跳过生成。
 
-默认数据量很大：单向量 HDF5 原始向量 payload 约 1.91 GiB；多向量按 `1000000 x 300 x 128 x fp16` 计算，仅向量 payload 约 71.53 GiB，实际文件还包含标量字段和 HDF5 元数据。标量字段中 `uuid1` / `uuid2` 使用标准 UUID 字符串，`platform` / `text` 使用 UTF-8 中文内容，`text` 为随机中文字符串。
+默认数据量很大：单向量 HDF5 原始向量 payload 约 1.91 GiB；多向量按 `1000000 x 300 x 128 x fp16` 计算，仅向量 payload 约 71.53 GiB，实际文件还包含标量字段和 HDF5 元数据。标量字段中 `id` 是查询和 update 匹配字段，并在写入脚本建 `INVERTED` 索引；`uuid1` / `uuid2` 使用标准 UUID 字符串，作为业务字段保留但不建索引；`platform` / `text` 使用 UTF-8 中文内容，`text` 为随机中文字符串。
 
 ## 执行前注意事项
 
 - 写入脚本默认会 drop 已存在的目标 collection 后重建；如果只是检查现有 collection，不要直接运行写入命令，或加 `--no-drop` 让脚本在 collection 已存在时报错退出。
 - update 脚本不会重建 collection，要求先用对应 insert 脚本写入 ready 数据；`--ready-data-dir` 必须指向 insert 生成的 HDF5 分片目录；如果 ready 行数不足以按 `--random-ratio` 生成目标 update 分片，脚本会在生成前报错，提示先重新运行 insert 脚本生成足够数据。
 - 写入脚本支持 `--num-shards`，传给 Milvus `create_collection(num_shards=...)`，只在新建 collection 时生效；写入脚本和查询脚本都支持 `--replica-number`，会在脚本主动 `load_collection(replica_number=...)` 时生效，需要集群有足够 QueryNode 或 resource group 容量。
-- 写入脚本支持 `--delete-ratio` 模拟 update 压力：默认 `0`，不执行额外操作；取值 `1-100` 时，每 100 条插入数据中选最后 N 条执行 `query -> delete -> insert`，其中 query/delete 使用 `uuid1` 和 `uuid2` 等值 filter，最后再把同一条记录原样插回去。
+- 写入脚本支持 `--delete-ratio` 模拟 update 压力：默认 `0`，不执行额外操作；取值 `1-100` 时，每 100 条插入数据中选最后 N 条执行 `query -> delete -> insert`，其中 query/delete 使用同一批命中记录的 `id in [...]` / `pk in [...]` 批量 filter，最后再把同一批记录原样插回去。
 - 参数必须保持一致：单向量写入的 `--vector-dim` 要等于查询脚本的 `--vector-dim`；多向量写入的 `--vector-dim` 要等于查询脚本的 `--multi-vector-dim`。
 - 多向量写入的 `--token-count` 是 collection 每条样本最大 token vector 数量，查询脚本的 `--query-token-count` 是每条查询使用的 token vector 数量；当前默认写入 300、查询 30。
 - 修改维度、token 数、`data_id_max` 或数据规模后，旧 HDF5 分片可能不再匹配；建议加 `--force-regenerate` 重新生成。查询脚本会在读取分片前校验 attrs 和 dataset shape。
-- `limit=4000`、`search_ef=4000` 对多向量查询非常重；正式压测前先用较小 `total_rows`、`limit` 和 `search_ef` 做冒烟与容量曲线。
+- `single_limit=4000`、`multi_limit=4000` 对多向量查询非常重；如果显式设置 `search_ef`，正式压测前先用较小 `total_rows`、`single_limit`、`multi_limit` 和 `search_ef` 做冒烟与容量曲线。
 - `--timeout` 默认 60 秒；多向量高 topK 查询可能触发 `DEADLINE_EXCEEDED`，需要结合服务端负载决定是否提高到 120/180 秒。
 
 ## 推荐执行顺序
 
 1. 先跑“常用变体”里的小规模功能测试，确认客户端依赖、数据库权限、建表、写入和查询链路都正常。
 2. 再分别跑单向量写入和多向量写入；写入完成后确认脚本摘要里的 `success_rate`、`success_rows`、collection 名称、维度、`num_shards` 和 `replica_number`。
-3. 查询压测先跑 `--target single`，再跑 `--target multi`，最后再跑 `--target both`；多向量建议先降低 `--total-rows`、`--limit` 和 `--search-ef` 做容量曲线。
+3. 查询压测先跑 `--target single`，再跑 `--target multi`，最后再跑 `--target both`；多向量建议先降低 `--total-rows`、`--single-limit` / `--multi-limit` 和 `--search-ef` 做容量曲线。
 4. 需要看 collection 内存时，先用 `scripts/collection_memory.py` 拿到 `collection_id`；如果 PyMilvus `mem_size` 返回 0，再进 QueryNode 容器或端口转发 `/metrics` 按 `collection_id` 过滤真实 size 指标。
 5. 每轮正式压测建议用 `tee` 保存完整输出，后续对照 Milvus QueryNode、DataNode、Proxy、磁盘 IO 和网络监控一起看。
 
@@ -79,7 +79,7 @@ export MILVUS_URI="http://localhost:19530"
 
 - `wall_elapsed(s)` 只统计并发执行阶段，不包含数据生成、建表、load collection 和 flush 时间。
 - 写入脚本里的 `operation` 是一次 `client.insert()` 调用，通常等于一个 batch。
-- 查询脚本里的 `operation` 是一个查询样本；当 `--target both` 时，一个 operation 内会依次执行单向量查询和多向量查询。
+- 查询脚本里的 `operation` 是一个查询样本；当 `--target both` 时，一个 operation 内会先执行单向量查询，再执行多向量查询。`--multi-id-filter in` 在 `both` 下会把 single 返回的 `--single-limit` 个 id 作为 multi 查询的 `id in [...]` 过滤条件；在 `multi` 下会基于当前查询样本 id 确定性模拟 `--single-limit` 个 id。
 - update 脚本里的 `operation` 是一个 update batch；batch 内会批量 query 一次、命中时批量 delete 一次，然后批量 insert 一次。
 - `TP50(s)` / `TP90(s)` / `TP99(s)` 只统计成功 operation 的耗时。
 - `read_TP*` / `prep_TP*` / `rpc_TP*` 是辅助验证指标，分别对应 HDF5 读取、Python 对象构造和 Milvus RPC。
@@ -116,9 +116,11 @@ export MILVUS_URI="http://localhost:19530"
 - `concurrency`：worker 池并发数；`executor_kind` 默认为 `process`，也可显式改为 `thread`。
 - `index_type`：向量索引类型，默认 `HNSW`。
 - `metric_type`：当前向量检索 metric；多向量默认 `MAX_SIM_COSINE`。
-- `limit`：查询 topK，正式压测默认 4000。
-- `search_ef`：HNSW 查询参数 `ef`，默认 4000；执行查询时应不小于 `limit`。
-- `id_filter`：查询时是否附带 id 过滤，默认 `none`。
+- `single_limit`：single 查询 topK，正式压测默认 4000。
+- `multi_limit`：multi 查询 topK；`--target multi` 和 `--target both` 都使用该参数，默认等于 `single_limit`。
+- `search_ef`：可选 HNSW 查询参数 `ef`；不传或传 `none` 时不会写入 Milvus search API，由 Milvus 使用默认值。传数字时应不小于实际使用的 topK，即 `single_limit` 和 `multi_limit` 中较大的值。
+- `single_id_filter`：single 查询是否附带 id 过滤，默认 `none`，取值 `none|eq|gte`。
+- `multi_id_filter`：multi 查询是否附带 id 过滤，默认 `eq`，取值 `none|eq|gte|in`；`in` 支持 `--target multi` 和 `--target both`；`both` 使用 single 实际返回的 id，`multi` 基于当前查询样本 id 确定性模拟 `single_limit` 个 id。
 
 ### CLI 参数补充
 
@@ -135,7 +137,7 @@ export MILVUS_URI="http://localhost:19530"
 - `--skip-generate`：跳过数据生成，直接读取现有 HDF5 分片执行建表、写入或查询。
 - `--generate-only`：只生成 HDF5 分片，生成完成后退出。
 - `--seed`：随机数据生成种子，默认 `20260610`。
-- `--delete-ratio`：仅写入脚本支持，范围 `0-100`，默认 `0`。为 `0` 时只执行原始插入；大于 0 时每 100 条中选最后 N 条模拟 update，流程为先按 `uuid1` 和 `uuid2` 等值查询，再删除旧记录，最后将同一条记录插回去。
+- `--delete-ratio`：仅写入脚本支持，范围 `0-100`，默认 `0`。为 `0` 时只执行原始插入；大于 0 时每 100 条中选最后 N 条模拟 update，流程为先按同一批记录的 `id in [...]` 批量查询，再按命中的 `pk in [...]` 批量删除旧记录，最后将同一批记录插回去。
 - `--executor-kind`：写入、查询和 update 脚本均支持 `thread|process`，默认 `process`。
 - `--ready-data-dir`：仅 update 脚本支持，指定对应 insert 脚本之前生成的 ready 分片目录；ready 行数不足时会直接报错。
 - `--random-ratio`：仅 update 脚本支持，范围 `1-100`；每 100 行窗口内按该比例生成随机新数据，其余从 `--ready-data-dir` 读取，并在窗口内打散。
@@ -144,6 +146,9 @@ export MILVUS_URI="http://localhost:19530"
 - `--hnsw-m` / `--hnsw-ef-construction`：建 HNSW 索引时的 `M` 和 `efConstruction` 参数。
 - `--metric-type`：写入脚本建索引用的 metric；单向量默认 `COSINE`，多向量 `struct-float32` 默认 `MAX_SIM_COSINE`。
 - `--single-metric-type` / `--multi-metric-type` / `--flat-metric-type`：查询脚本搜索参数 metric；分别用于单向量、`struct-float32` 多向量和 `flat-fp16` 多向量。
+- `--single-limit` / `--multi-limit`：查询脚本 topK 参数；single 查询使用 `--single-limit`，multi 查询使用 `--multi-limit`，`--multi-limit` 不传时默认等于 `--single-limit`。
+- `--single-id-filter` / `--multi-id-filter`：查询脚本 id 过滤参数；single 默认 `none`，multi 默认 `eq`，`--multi-id-filter in` 支持 `--target multi` 和 `--target both`；`multi` 会基于当前查询样本 id 确定性模拟 `--single-limit` 个 id，`both` 使用 single 实际返回 id。
+- `--search-ef`：可选 HNSW `ef` 参数；不传或传 `none` 时不会写入 Milvus search API。
 - `--data-id-max`：查询样本随机生成 id 的最大值，默认 `1000000`；应与已写入数据的 id 范围一致。
 - `--vector-chunk-rows`：多向量写入脚本生成 HDF5 `vector` dataset 时使用的 chunk 行数，默认 `4`；只影响本地分片文件的读写块大小，不影响 Milvus schema、向量维度、token 数或写入批次大小。
 
@@ -356,12 +361,13 @@ uv run python scripts/query_benchmark.py \
   --concurrency 8 \
   --prefetch-batches 16 \
   --executor-kind process \
-  --limit 4000 \
+  --single-limit 4000 \
+  --multi-limit 4000 \
   --single-metric-type COSINE \
   --multi-metric-type MAX_SIM_COSINE \
   --flat-metric-type COSINE \
-  --search-ef 4000 \
-  --id-filter none \
+  --single-id-filter none \
+  --multi-id-filter eq \
   --seed 20260610
 ```
 
@@ -373,7 +379,7 @@ uv run python scripts/query_benchmark.py \
 - `target=multi`：60 条查询成功 59 条、失败 1 条，失败原因为 `DEADLINE_EXCEEDED` 60 秒超时；`wall_elapsed=613.69s`，`TP50=40.985s`，`TP90=50.410s`，`TP99=54.857s`。
 - `target=both`：6 条查询全部成功，`success_rate=100.00%`，`wall_elapsed=56.33s`，`TP50=18.503s`，`TP90=20.885s`，`TP99=22.287s`。
 
-结论：维度拆分链路正常，没有发现单向量 1024 维和多向量 128 维的 shape/EmbeddingList 维度错配；当前主要瓶颈是多向量在 `limit=4000`、`search_ef=4000`、`query_token_count=30` 下查询非常重，并可能触发 60 秒 RPC timeout。正式压测多向量时建议先降低 `limit/search_ef` 做容量曲线，或提高 `--timeout` 到 120/180 秒后再观察 timeout 情况。
+结论：维度拆分链路正常，没有发现单向量 1024 维和多向量 128 维的 shape/EmbeddingList 维度错配；当前主要瓶颈是多向量在 `single_limit=4000`、`multi_limit=4000`、`query_token_count=30` 下查询非常重，并可能触发 60 秒 RPC timeout。正式压测多向量时建议先降低 `single_limit/multi_limit` 做容量曲线；如果需要手动控制 HNSW `ef`，再显式设置 `--search-ef`，或提高 `--timeout` 到 120/180 秒后观察 timeout 情况。
 
 ## FAQ
 
@@ -549,8 +555,8 @@ uv run python scripts/query_benchmark.py \
   --concurrency 8 \
   --prefetch-batches 16 \
   --executor-kind process \
-  --limit 4000 \
-  --search-ef 4000
+  --single-limit 4000 \
+  --multi-limit 4000 \
 ```
 
 ### 小规模功能测试
@@ -607,7 +613,8 @@ uv run python scripts/query_benchmark.py \
   --target both \
   --concurrency 1 \
   --query-read-batch-size 2 \
-  --limit 2 \
+  --single-limit 2 \
+  --multi-limit 2 \
   --timeout 20
 ```
 
@@ -634,8 +641,8 @@ PY
 ## 常见排查
 
 - `Invalid query shards`：查询分片和当前参数不匹配，常见于改过 `--vector-dim`、`--multi-vector-dim`、`--query-token-count` 或 `--data-id-max` 后继续复用旧 HDF5；加 `--force-regenerate` 重新生成。
-- `--search-ef must be >= --limit`：HNSW 查询参数太小；要么降低 `--limit`，要么提高 `--search-ef`。
-- `DEADLINE_EXCEEDED`：服务端在 `--timeout` 内没有完成 RPC；多向量高 topK 场景先降低 `--limit/search-ef/query-token-count` 做曲线，再考虑把 `--timeout` 提高到 120/180 秒。
+- `--search-ef must be >= max search limit`：显式设置的 HNSW 查询参数太小；要么降低 `--single-limit` / `--multi-limit`，要么提高 `--search-ef`，或不传 `--search-ef` 让 Milvus 使用默认值。
+- `DEADLINE_EXCEEDED`：服务端在 `--timeout` 内没有完成 RPC；多向量高 topK 场景先降低 `--single-limit/multi-limit/query-token-count`，或按需要显式设置 `--search-ef` 做曲线，再考虑把 `--timeout` 提高到 120/180 秒。
 - `now only float vector is supported`：当前服务端不支持 Struct 内 `FLOAT16_VECTOR`；保持默认 `--multi-vector-mode struct-float32`。
 - `127.0.0.1:9091` 访问失败：这个地址通常只在 Milvus 容器或 Pod 内可见；在客户端机器执行时需要端口转发，或改成实际可访问的 metrics 地址。
 - `collection_memory.py` 里 `loaded_mem=0`：当前服务端可能没有返回可用的 segment `mem_size`；此时只能把 `payload_*` 当估算值，真实内存以 `/metrics`、容器 RSS 或运维监控为准。

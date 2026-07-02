@@ -309,15 +309,13 @@ def decode_bytes(value: Any) -> str:
 
 
 
-def milvus_string_literal(value: object) -> str:
-    text = str(value)
-    return chr(34) + text.replace(chr(92), chr(92) + chr(92)).replace(chr(34), chr(92) + chr(34)) + chr(34)
+def batch_id_filter(records: list[dict[str, object]]) -> str:
+    id_values = ", ".join(str(int(record["id"])) for record in records)
+    return f"id in [{id_values}]"
 
 
-def record_delete_filter(record: dict[str, object]) -> str:
-    uuid1 = milvus_string_literal(record["uuid1"])
-    uuid2 = milvus_string_literal(record["uuid2"])
-    return f"uuid1 == {uuid1} and uuid2 == {uuid2}"
+def batch_pk_filter(pk_values: list[int]) -> str:
+    return "pk in [" + ", ".join(str(pk) for pk in pk_values) + "]"
 
 
 def delete_ratio_candidates(records: list[dict[str, object]], delete_ratio: int) -> list[dict[str, object]]:
@@ -333,17 +331,27 @@ def query_delete_then_insert_records(
     records: list[dict[str, object]],
     timeout: float,
 ) -> tuple[int, int]:
-    found_count = 0
-    deleted_count = 0
-    for record in records:
-        expr = record_delete_filter(record)
-        rows = client.query(collection_name=collection_name, filter=expr, output_fields=["uuid1", "uuid2"], timeout=timeout)
-        found_count += len(rows or [])
-        client.delete(collection_name=collection_name, filter=expr, timeout=timeout)
-        deleted_count += 1
-    if records:
-        client.insert(collection_name=collection_name, data=records, timeout=timeout)
-    return found_count, deleted_count
+    if not records:
+        return 0, 0
+
+    expected_ids = {int(record["id"]) for record in records}
+    rows = client.query(collection_name=collection_name, filter=batch_id_filter(records), output_fields=["pk", "id"], timeout=timeout)
+
+    delete_pks: list[int] = []
+    seen_pks: set[int] = set()
+    for row in rows or []:
+        row_id = row.get("id")
+        pk = row.get("pk")
+        if row_id is not None and int(row_id) in expected_ids and pk is not None:
+            pk_value = int(pk)
+            if pk_value not in seen_pks:
+                seen_pks.add(pk_value)
+                delete_pks.append(pk_value)
+
+    if delete_pks:
+        client.delete(collection_name=collection_name, filter=batch_pk_filter(delete_pks), timeout=timeout)
+    client.insert(collection_name=collection_name, data=records, timeout=timeout)
+    return len(rows or []), 1 if delete_pks else 0
 
 def iter_h5_slice_specs(paths: Iterable[Path], batch_size: int) -> Iterator[H5SliceSpec]:
     for path in paths:

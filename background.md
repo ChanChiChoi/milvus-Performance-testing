@@ -15,7 +15,7 @@ milvus的数据库叫llmbp
 脚本1：
 基于bge-large系列模型生成的单向量
 1：先创建一个colletion(如果存在则删除重建，名称叫test_vector)
-2: 构建的schema ：一个数值id（不是主键），两组uuid，platform（字符串，值只有suning、taobao、jingdong，随机三选一），text（50个字符，随机生成），vector（1024维度，fp16类型，索引是hnsw）
+2: 构建的schema ：一个数值id（不是主键，建 INVERTED 索引，用于查询和 update 匹配），两组uuid（业务字段，不建索引），platform（字符串，值只有suning、taobao、jingdong，随机三选一），text（50个字符，随机生成），vector（1024维度，fp16类型，索引是hnsw）
 3：单独一个函数构建基于上面schema的100万条数据写入对应目录下的分片文件，后续重新执行该脚本如果检测到对应目录已有4个分片且合计100万条，则跳过数据生成
 4：可以设置写入的并发数
 5：记录写操作的耗时，写完这100万条，
@@ -31,7 +31,7 @@ milvus的数据库叫llmbp
 脚本2：
 基于colbert生成的多向量
 1：先创建一个colletion(如果存在则删除重建，名称叫test_multi_vector)
-2: 构建的schema ：一个数值id（1-100万顺序编码），两组uuid，platform（字符串，值只有suning、taobao、jingdong，随机三选一），text（50个字符，随机生成），vector（300*1024维度，fp16类型）
+2: 构建的schema ：一个数值id（1-100万顺序编码，建 INVERTED 索引，用于查询和 update 匹配），两组uuid（业务字段，不建索引），platform（字符串，值只有suning、taobao、jingdong，随机三选一），text（50个字符，随机生成），vector（300*1024维度，fp16类型）
 3：单独一个函数构建基于上面schema的100万条数据写入对应目录下的分片文件，后续重新执行该脚本如果检测到对应目录已有4个分片且合计100万条，则跳过数据生成
 4：可以设置写入的并发数
 5：记录写操作的耗时，写完这100万条，
@@ -47,8 +47,8 @@ milvus的数据库叫llmbp
 基于脚本1和脚本2完全写入的基础上，做查询压测
 1：生成随机查询的单条向量1*1024、模拟colbert的30*1024的向量、还有随机生成1-100万数值范围内的数值id，组成一个完整的查询样本
 2：生成100万条查询样本写入对应目录下的分片文件，也是一样，后续重新执行如果检测到对应目录已有4个分片且合计100万条，则跳过
-3：将上述100万条查询样本进行加载到内存，要求milvus返回最相似的4000个结果
-4：支持设置查询并发数，一个并发对应一个样本，
+3：将上述100万条查询样本进行加载到内存，single 查询按 single-limit 返回 topK，multi 查询按 multi-limit 返回 topK
+4：支持设置查询并发数，一个并发对应一个样本；multi-id-filter 支持 none/eq/gte/in，其中 target=multi 且 in 时按 single-limit 基于当前查询样本 id 确定性模拟 id 集合，target=both 且 in 时使用 single 实际返回的 id 集合
 5：一样要有进度条
 
 输出：
