@@ -41,7 +41,7 @@ MODE_FLAT_FP16 = "flat-fp16"
 _PROCESS_STATE: dict[str, object] = {}
 
 
-def init_process_worker(config: MilvusConfig, target: str, single_collection: str, multi_collection: str, single_id_filter: str, multi_id_filter: str, single_limit: int, multi_limit: int, search_ef: int | None, timeout: float, single_metric_type: str, multi_metric_type: str, flat_metric_type: str, multi_vector_mode: str, multi_vector_dim: int, data_id_max: int) -> None:
+def init_process_worker(config: MilvusConfig, target: str, single_collection: str, multi_collection: str, single_id_filter: str, multi_id_filter: str, single_limit: int, multi_limit: int, search_ef: int | None, timeout: float, consistency_level: str, single_metric_type: str, multi_metric_type: str, flat_metric_type: str, multi_vector_mode: str, multi_vector_dim: int, data_id_max: int) -> None:
     _PROCESS_STATE.clear()
     _PROCESS_STATE.update(
         {
@@ -55,6 +55,7 @@ def init_process_worker(config: MilvusConfig, target: str, single_collection: st
             "multi_limit": multi_limit,
             "search_ef": search_ef,
             "timeout": timeout,
+            "consistency_level": consistency_level,
             "single_metric_type": single_metric_type,
             "multi_metric_type": multi_metric_type,
             "flat_metric_type": flat_metric_type,
@@ -105,6 +106,7 @@ def process_query_worker(spec: H5SliceSpec) -> list[OperationResult]:
                     output_fields=["id", "platform"],
                     search_params=build_search_params(state["single_metric_type"], state["search_ef"]),  # type: ignore[arg-type]
                     timeout=state["timeout"],  # type: ignore[index]
+                    consistency_level=state["consistency_level"],  # type: ignore[index]
                 )
                 if state["target"] == "both" and state["multi_id_filter"] == "in":
                     single_ids = extract_search_ids(single_result)
@@ -124,6 +126,7 @@ def process_query_worker(spec: H5SliceSpec) -> list[OperationResult]:
                         output_fields=["id", "platform"],
                         search_params=build_search_params(state["multi_metric_type"], state["search_ef"]),  # type: ignore[arg-type]
                         timeout=state["timeout"],  # type: ignore[index]
+                        consistency_level=state["consistency_level"],  # type: ignore[index]
                     )
                 else:
                     client.search(
@@ -135,6 +138,7 @@ def process_query_worker(spec: H5SliceSpec) -> list[OperationResult]:
                         output_fields=["id", "platform"],
                         search_params=build_search_params(state["flat_metric_type"], state["search_ef"]),  # type: ignore[arg-type]
                         timeout=state["timeout"],  # type: ignore[index]
+                        consistency_level=state["consistency_level"],  # type: ignore[index]
                     )
             rpc_elapsed = time.perf_counter() - rpc_start
             elapsed = time.perf_counter() - worker_start
@@ -420,6 +424,7 @@ def run_queries(args: argparse.Namespace) -> None:
                 effective_multi_limit(args),
                 args.search_ef,
                 args.timeout,
+                args.consistency_level,
                 args.single_metric_type,
                 args.multi_metric_type,
                 args.flat_metric_type,
@@ -459,6 +464,7 @@ def run_queries(args: argparse.Namespace) -> None:
                         output_fields=["id", "platform"],
                         search_params=build_search_params(args.single_metric_type, args.search_ef),
                         timeout=args.timeout,
+                        consistency_level=args.consistency_level,
                     )
                     if args.target == "both" and args.multi_id_filter == "in":
                         single_ids = extract_search_ids(single_result)
@@ -478,6 +484,7 @@ def run_queries(args: argparse.Namespace) -> None:
                             output_fields=["id", "platform"],
                             search_params=build_search_params(args.multi_metric_type, args.search_ef),
                             timeout=args.timeout,
+                            consistency_level=args.consistency_level,
                         )
                     else:
                         client.search(
@@ -489,6 +496,7 @@ def run_queries(args: argparse.Namespace) -> None:
                             output_fields=["id", "platform"],
                             search_params=build_search_params(args.flat_metric_type, args.search_ef),
                             timeout=args.timeout,
+                            consistency_level=args.consistency_level,
                         )
                 rpc_elapsed = time.perf_counter() - rpc_start
                 elapsed = time.perf_counter() - worker_start
@@ -513,6 +521,7 @@ def run_queries(args: argparse.Namespace) -> None:
             "uri": config.uri,
             "db_name": config.db_name,
             "target": args.target,
+            "consistency_level": args.consistency_level,
             "single_collection": args.single_collection,
             "multi_collection": args.multi_collection,
             "replica_number": args.replica_number,

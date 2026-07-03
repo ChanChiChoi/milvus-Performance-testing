@@ -36,6 +36,8 @@ DEFAULT_DB_NAME = "llmbp"
 DEFAULT_TOTAL_ROWS = 1_000_000
 DEFAULT_SHARD_ROWS = 250_000
 DEFAULT_TIMEOUT = 60.0
+DEFAULT_CONSISTENCY_LEVEL = "Bounded"
+CONSISTENCY_LEVELS = ("Strong", "Session", "Bounded", "Eventually")
 COMMON_DATA_VERSION = 2
 PLATFORMS = np.asarray(["苏宁".encode("utf-8"), "淘宝".encode("utf-8"), "京东".encode("utf-8")], dtype="S16")
 TEXT_CHARS = np.asarray(list("的一是在不了有和人这中大为上个国我以要他时来用们生到作地于出就分对成会可主发年动同工也能下过子说产种面而方后多定行学法所民得经十三之进着等部度家电力里如水化高自二理起小物现实加量都两体制机当使点从业本去把性好应开它合还因由其些然前外天政四日那社义事平形相全表间样与关各重新线内数正心反你明看原又么利比或但质气第向道命此变条只没结解问意建月公无系军很情者最立代想已通并提直题党程展五果料象员革位入常文总次品式活设及管特件长求老头基资边流路级少图山统接知较将组见计别她手角期根论运农指几九区强放决西被干做必战先回则任取据处理世受领"))
@@ -137,6 +139,12 @@ def add_connection_args(parser: Any) -> None:
     parser.add_argument("--password", default="", help="Milvus password")
     parser.add_argument("--token", default="", help="Milvus token")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="Milvus RPC timeout")
+    parser.add_argument(
+        "--consistency-level",
+        choices=CONSISTENCY_LEVELS,
+        default=DEFAULT_CONSISTENCY_LEVEL,
+        help=f"Milvus consistency level for collection creation and read/write requests. Defaults to {DEFAULT_CONSISTENCY_LEVEL}.",
+    )
     parser.add_argument(
         "--create-db",
         action="store_true",
@@ -330,12 +338,19 @@ def query_delete_then_insert_records(
     collection_name: str,
     records: list[dict[str, object]],
     timeout: float,
+    consistency_level: str,
 ) -> tuple[int, int]:
     if not records:
         return 0, 0
 
     expected_ids = {int(record["id"]) for record in records}
-    rows = client.query(collection_name=collection_name, filter=batch_id_filter(records), output_fields=["pk", "id"], timeout=timeout)
+    rows = client.query(
+        collection_name=collection_name,
+        filter=batch_id_filter(records),
+        output_fields=["pk", "id"],
+        timeout=timeout,
+        consistency_level=consistency_level,
+    )
 
     delete_pks: list[int] = []
     seen_pks: set[int] = set()
@@ -349,8 +364,13 @@ def query_delete_then_insert_records(
                 delete_pks.append(pk_value)
 
     if delete_pks:
-        client.delete(collection_name=collection_name, filter=batch_pk_filter(delete_pks), timeout=timeout)
-    client.insert(collection_name=collection_name, data=records, timeout=timeout)
+        client.delete(
+            collection_name=collection_name,
+            filter=batch_pk_filter(delete_pks),
+            timeout=timeout,
+            consistency_level=consistency_level,
+        )
+    client.insert(collection_name=collection_name, data=records, timeout=timeout, consistency_level=consistency_level)
     return len(rows or []), 1 if delete_pks else 0
 
 def iter_h5_slice_specs(paths: Iterable[Path], batch_size: int) -> Iterator[H5SliceSpec]:

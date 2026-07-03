@@ -173,6 +173,7 @@ def process_update_worker(spec: H5SliceSpec) -> UpdateOperationResult:
             collection_name=state['collection_name'],  # type: ignore[arg-type]
             records=records,
             timeout=state['timeout'],  # type: ignore[arg-type]
+            consistency_level=state['consistency_level'],  # type: ignore[arg-type]
         )
         return UpdateOperationResult(
             len(records),
@@ -220,7 +221,7 @@ def update_records(args: argparse.Namespace) -> None:
             prefetch_batches=prefetch_batches,
             executor_kind='process',
             executor_initializer=init_update_process_worker,
-            executor_initargs=(config, args.collection_name, args.timeout, 'single'),
+            executor_initargs=(config, args.collection_name, args.timeout, 'single', args.consistency_level),
         )
     else:
         def worker(batch: dict[str, np.ndarray]) -> UpdateOperationResult:
@@ -236,6 +237,7 @@ def update_records(args: argparse.Namespace) -> None:
                     collection_name=args.collection_name,
                     records=records,
                     timeout=args.timeout,
+                    consistency_level=args.consistency_level,
                 )
                 return UpdateOperationResult(
                     len(records),
@@ -273,6 +275,7 @@ def update_records(args: argparse.Namespace) -> None:
             'uri': config.uri,
             'db_name': config.db_name,
             'collection': args.collection_name,
+            'consistency_level': args.consistency_level,
             'replica_number': args.replica_number,
             'ready_data_dir': args.ready_data_dir,
             'data_dir': args.data_dir,

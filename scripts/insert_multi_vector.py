@@ -48,7 +48,7 @@ MODE_FLAT_FP16 = "flat-fp16"
 _PROCESS_STATE: dict[str, object] = {}
 
 
-def init_process_worker(config: MilvusConfig, collection_name: str, delete_ratio: int, timeout: float, mode: str) -> None:
+def init_process_worker(config: MilvusConfig, collection_name: str, delete_ratio: int, timeout: float, mode: str, consistency_level: str) -> None:
     _PROCESS_STATE.clear()
     _PROCESS_STATE.update(
         {
@@ -57,6 +57,7 @@ def init_process_worker(config: MilvusConfig, collection_name: str, delete_ratio
             "delete_ratio": delete_ratio,
             "timeout": timeout,
             "mode": mode,
+            "consistency_level": consistency_level,
         }
     )
 
@@ -74,7 +75,12 @@ def process_insert_worker(spec: H5SliceSpec) -> OperationResult:
     try:
         client = get_thread_client(state["config"])  # type: ignore[arg-type]
         rpc_start = time.perf_counter()
-        client.insert(collection_name=state["collection_name"], data=records, timeout=state["timeout"])  # type: ignore[index]
+        client.insert(
+            collection_name=state["collection_name"],
+            data=records,
+            timeout=state["timeout"],
+            consistency_level=state["consistency_level"],
+        )  # type: ignore[index]
         delete_records = delete_ratio_candidates(records, state["delete_ratio"])  # type: ignore[arg-type]
         if delete_records:
             query_delete_then_insert_records(
@@ -82,6 +88,7 @@ def process_insert_worker(spec: H5SliceSpec) -> OperationResult:
                 collection_name=state["collection_name"],  # type: ignore[index]
                 records=delete_records,
                 timeout=state["timeout"],  # type: ignore[index]
+                consistency_level=state["consistency_level"],  # type: ignore[index]
             )
         rpc_elapsed = time.perf_counter() - rpc_start
         elapsed = time.perf_counter() - worker_start
@@ -223,6 +230,7 @@ def create_collection(args: argparse.Namespace) -> None:
             schema=schema,
             num_shards=args.num_shards,
             timeout=args.timeout,
+            consistency_level=args.consistency_level,
         )
         client.create_index(args.collection_name, index_params, timeout=args.timeout)
         client.load_collection(
@@ -285,7 +293,7 @@ def insert_records(args: argparse.Namespace) -> None:
             prefetch_batches=prefetch_batches,
             executor_kind="process",
             executor_initializer=init_process_worker,
-            executor_initargs=(config, args.collection_name, args.delete_ratio, args.timeout, args.multi_vector_mode),
+            executor_initargs=(config, args.collection_name, args.delete_ratio, args.timeout, args.multi_vector_mode, args.consistency_level),
         )
     else:
         def batches() -> object:
@@ -298,7 +306,7 @@ def insert_records(args: argparse.Namespace) -> None:
             try:
                 client = get_thread_client(config)
                 rpc_start = time.perf_counter()
-                client.insert(collection_name=args.collection_name, data=records, timeout=args.timeout)
+                client.insert(collection_name=args.collection_name, data=records, timeout=args.timeout, consistency_level=args.consistency_level)
                 delete_records = delete_ratio_candidates(records, args.delete_ratio)
                 if delete_records:
                     query_delete_then_insert_records(
@@ -306,6 +314,7 @@ def insert_records(args: argparse.Namespace) -> None:
                         collection_name=args.collection_name,
                         records=delete_records,
                         timeout=args.timeout,
+                        consistency_level=args.consistency_level,
                     )
                 rpc_elapsed = time.perf_counter() - rpc_start
                 elapsed = time.perf_counter() - worker_start
@@ -336,6 +345,7 @@ def insert_records(args: argparse.Namespace) -> None:
             "uri": config.uri,
             "db_name": config.db_name,
             "collection": args.collection_name,
+            "consistency_level": args.consistency_level,
             "num_shards": args.num_shards,
             "replica_number": args.replica_number,
             "data_dir": args.data_dir,

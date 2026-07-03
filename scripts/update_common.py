@@ -91,7 +91,7 @@ class UpdateBenchmarkResult:
 _PROCESS_STATE: dict[str, object] = {}
 
 
-def init_update_process_worker(config: MilvusConfig, collection_name: str, timeout: float, mode: str) -> None:
+def init_update_process_worker(config: MilvusConfig, collection_name: str, timeout: float, mode: str, consistency_level: str) -> None:
     _PROCESS_STATE.clear()
     _PROCESS_STATE.update(
         {
@@ -99,6 +99,7 @@ def init_update_process_worker(config: MilvusConfig, collection_name: str, timeo
             'collection_name': collection_name,
             'timeout': timeout,
             'mode': mode,
+            'consistency_level': consistency_level,
         }
     )
 
@@ -322,6 +323,7 @@ def query_delete_insert_records(
     collection_name: str,
     records: list[dict[str, object]],
     timeout: float,
+    consistency_level: str,
 ) -> tuple[float, float, float, int, int, int, int]:
     if not records:
         return 0.0, 0.0, 0.0, 0, 0, 0, 0
@@ -333,6 +335,7 @@ def query_delete_insert_records(
         filter=batch_query_filter(records),
         output_fields=['pk', 'id'],
         timeout=timeout,
+        consistency_level=consistency_level,
     )
     query_elapsed = time.perf_counter() - query_start
     query_count = 1
@@ -352,13 +355,18 @@ def query_delete_insert_records(
     delete_count = 0
     if delete_pks:
         delete_start = time.perf_counter()
-        client.delete(collection_name=collection_name, filter=batch_pk_filter(delete_pks), timeout=timeout)
+        client.delete(
+            collection_name=collection_name,
+            filter=batch_pk_filter(delete_pks),
+            timeout=timeout,
+            consistency_level=consistency_level,
+        )
         delete_elapsed = time.perf_counter() - delete_start
         delete_count = 1
 
     insert_records = [{key: value for key, value in record.items() if key != 'source'} for record in records]
     insert_start = time.perf_counter()
-    client.insert(collection_name=collection_name, data=insert_records, timeout=timeout)
+    client.insert(collection_name=collection_name, data=insert_records, timeout=timeout, consistency_level=consistency_level)
     insert_elapsed = time.perf_counter() - insert_start
     insert_count = 1
     return query_elapsed, delete_elapsed, insert_elapsed, len(delete_pks), query_count, delete_count, insert_count

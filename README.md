@@ -62,6 +62,7 @@ export MILVUS_URI="http://localhost:19530"
 - 修改维度、token 数、`data_id_max` 或数据规模后，旧 HDF5 分片可能不再匹配；建议加 `--force-regenerate` 重新生成。查询脚本会在读取分片前校验 attrs 和 dataset shape。
 - `single_limit=4000`、`multi_limit=4000` 对多向量查询非常重；如果显式设置 `search_ef`，正式压测前先用较小 `total_rows`、`single_limit`、`multi_limit` 和 `search_ef` 做冒烟与容量曲线。
 - `--timeout` 默认 60 秒；多向量高 topK 查询可能触发 `DEADLINE_EXCEEDED`，需要结合服务端负载决定是否提高到 120/180 秒。
+- `--consistency-level` 默认 `Bounded`；写入脚本建 collection 时会作为默认一致性传入，写入、查询和 update 脚本里的 search/query/delete/insert RPC 也会显式使用该值。
 
 ## 推荐执行顺序
 
@@ -95,6 +96,7 @@ export MILVUS_URI="http://localhost:19530"
 - `uri`：Milvus 服务地址。
 - `db_name`：Milvus database 名称。
 - `collection`：写入脚本当前重建并写入的 collection。
+- `consistency_level`：本轮 Milvus 一致性级别，默认 `Bounded`；可选 `Strong|Session|Bounded|Eventually`。
 - `num_shards`：Milvus collection 写入分片数，写入脚本默认 `8`；这是远端 collection 的 shard 数，不是本地 HDF5 分片行数。
 - `replica_number`：脚本主动加载 collection 时使用的副本数，写入和查询脚本默认 `2`。
 - `single_collection` / `multi_collection`：查询脚本使用的单向量和多向量 collection。
@@ -128,6 +130,7 @@ export MILVUS_URI="http://localhost:19530"
 
 - `--user` / `--password` / `--token`：Milvus 认证参数；未开启认证时保持默认空字符串。
 - `--timeout`：Milvus RPC 超时时间，单位秒，默认 `60`。
+- `--consistency-level`：Milvus 一致性级别，默认 `Bounded`；可选 `Strong|Session|Bounded|Eventually`。
 - `--create-db`：当 `--db-name` 不存在时自动创建 database；不加时 database 不存在会报错退出。
 - `--collection-name`：写入脚本重建并写入的 collection 名称；查询脚本使用 `--single-collection` 和 `--multi-collection` 指定查询目标。
 - `--num-shards`：仅写入脚本支持，创建 Milvus collection 时传入的 shard 数，默认 `8`；修改该值需要重建 collection。
